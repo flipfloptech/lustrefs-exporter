@@ -36,10 +36,10 @@ fn generate_records() -> Vec<Record> {
 
 fn encode_metrics(records: Vec<Record>) -> String {
     let mut registry = Registry::default();
-    let mut metrics = Metrics::default();
+    let metrics = Metrics::default();
 
     // Build metrics
-    build_lustre_stats(&records, &mut metrics);
+    build_lustre_stats(&records, &metrics);
 
     metrics.register_metric(&mut registry);
 
