@@ -13,6 +13,10 @@ pub struct LliteMetrics {
 }
 
 impl LliteMetrics {
+    pub fn clear(&self) {
+        self.client_stats.clear();
+    }
+
     pub fn register_metric(&self, registry: &mut Registry) {
         registry.register_without_auto_suffix(
             "lustre_client_stats",

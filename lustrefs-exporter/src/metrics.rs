@@ -31,6 +31,19 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    pub fn clear(&self) {
+        self.host.clear();
+        self.quota.clear();
+        self.service.clear();
+        self.brw.clear();
+        self.llite.clear();
+        self.lnet.clear();
+        self.stats.clear();
+        self.export.clear();
+        self.mds.clear();
+        self.target_info.clear();
+    }
+
     pub fn register_metric(&self, registry: &mut Registry) {
         self.host.register_metric(registry);
         self.quota.register_metric(registry);

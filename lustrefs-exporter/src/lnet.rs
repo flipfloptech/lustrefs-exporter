@@ -17,6 +17,15 @@ pub struct LNetMetrics {
 }
 
 impl LNetMetrics {
+    pub fn clear(&self) {
+        self.send_count_total.clear();
+        self.receive_count_total.clear();
+        self.drop_count_total.clear();
+        self.send_bytes_total.clear();
+        self.receive_bytes_total.clear();
+        self.drop_bytes_total.clear();
+    }
+
     pub fn register_metric(&self, registry: &mut Registry) {
         registry.register(
             "lustre_send_count",

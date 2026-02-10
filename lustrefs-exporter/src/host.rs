@@ -19,6 +19,13 @@ pub struct HostMetrics {
 }
 
 impl HostMetrics {
+    pub fn clear(&self) {
+        self.lustre_targets_healthy.clear();
+        self.lnet_mem_used.clear();
+        self.mem_used.clear();
+        self.mem_used_max.clear();
+    }
+
     pub fn register_metric(&self, registry: &mut Registry) {
         registry.register(
             "lustre_health_healthy",

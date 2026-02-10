@@ -14,6 +14,11 @@ pub struct ServiceMetrics {
 }
 
 impl ServiceMetrics {
+    pub fn clear(&self) {
+        self.ldlm_canceld_stats.clear();
+        self.ldlm_cbd_stats.clear();
+    }
+
     pub fn register_metric(&self, registry: &mut Registry) {
         registry.register_without_auto_suffix(
             "lustre_ldlm_canceld_stats",

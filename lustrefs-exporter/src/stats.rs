@@ -50,6 +50,37 @@ pub struct StatsMetrics {
 }
 
 impl StatsMetrics {
+    pub fn clear(&self) {
+        self.read_samples_total.clear();
+        self.read_minimum_size_bytes.clear();
+        self.read_maximum_size_bytes.clear();
+        self.read_bytes_total.clear();
+        self.write_samples_total.clear();
+        self.write_minimum_size_bytes.clear();
+        self.write_maximum_size_bytes.clear();
+        self.write_bytes_total.clear();
+        self.get_page_total.clear();
+        self.cache_access_total.clear();
+        self.cache_hit_total.clear();
+        self.cache_miss_total.clear();
+        self.many_credits_total.clear();
+        self.stats_total.clear();
+        self.stats_time_min.clear();
+        self.stats_time_max.clear();
+        self.stats_time_total.clear();
+        self.mds_mdt_stats.clear();
+        self.mds_mdt_fld_stats.clear();
+        self.mds_mdt_io_stats.clear();
+        self.mds_mdt_out_stats.clear();
+        self.mds_mdt_readpage_stats.clear();
+        self.mds_mdt_seqm_stats.clear();
+        self.mds_mdt_seqs_stats.clear();
+        self.mds_mdt_setattr_stats.clear();
+        self.client_export_stats.clear();
+        self.client_export_milliseconds.clear();
+        self.client_export_bytes.clear();
+    }
+
     pub fn register_metric(&self, registry: &mut Registry) {
         registry.register(
             "lustre_read_samples",

@@ -23,7 +23,7 @@ enum State {
     TargetJobStats(String, String, Vec<String>),
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct JobstatMetrics {
     read_samples_total: Family<Counter<u64>>,
     read_minimum_size_bytes: Family<Gauge<u64, AtomicU64>>,
@@ -38,6 +38,19 @@ pub struct JobstatMetrics {
 }
 
 impl JobstatMetrics {
+    pub fn clear(&self) {
+        self.read_samples_total.clear();
+        self.read_minimum_size_bytes.clear();
+        self.read_maximum_size_bytes.clear();
+        self.read_bytes_total.clear();
+        self.write_samples_total.clear();
+        self.write_minimum_size_bytes.clear();
+        self.write_maximum_size_bytes.clear();
+        self.write_bytes_total.clear();
+        self.stats_total.clear();
+        self.target_info.clear();
+    }
+
     pub fn register_metric(&self, registry: &mut Registry) {
         registry.register(
             "lustre_job_read_samples",

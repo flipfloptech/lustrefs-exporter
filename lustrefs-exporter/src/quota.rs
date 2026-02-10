@@ -17,6 +17,14 @@ pub struct QuotaMetrics {
 }
 
 impl QuotaMetrics {
+    pub fn clear(&self) {
+        self.quota_hard.clear();
+        self.quota_soft.clear();
+        self.quota_granted.clear();
+        self.quota_used_kbytes.clear();
+        self.quota_used_inodes.clear();
+    }
+
     pub fn register_metric(&self, registry: &mut Registry) {
         registry.register(
             "lustre_quota_hard",

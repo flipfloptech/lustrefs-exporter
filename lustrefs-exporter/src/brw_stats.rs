@@ -58,6 +58,44 @@ pub struct BrwStatsMetrics {
 }
 
 impl BrwStatsMetrics {
+    pub fn clear(&self) {
+        self.disk_io_total.clear();
+        self.disk_io_frags.clear();
+        self.disk_io.clear();
+        self.discontiguous_pages_total.clear();
+        self.discontiguous_blocks_total.clear();
+        self.io_time_milliseconds_total.clear();
+        self.pages_per_bulk_rw_total.clear();
+        self.inodes_free.clear();
+        self.inodes_maximum.clear();
+        self.available_kbytes.clear();
+        self.free_kbytes.clear();
+        self.capacity_kbytes.clear();
+        self.exports_total.clear();
+        self.exports_dirty_total.clear();
+        self.exports_granted_total.clear();
+        self.exports_pending_total.clear();
+        self.lock_contended_total.clear();
+        self.lock_contention_seconds_total.clear();
+        self.connected_clients.clear();
+        self.lock_count_total.clear();
+        self.lock_timeout_total.clear();
+        self.block_maps_msec_total.clear();
+        self.recovery_status.clear();
+        self.recovery_status_completed_clients.clear();
+        self.recovery_status_connected_clients.clear();
+        self.recovery_status_evicted_clients.clear();
+        self.recovery_status_duration_seconds.clear();
+        self.recovery_status_time_remaining_seconds.clear();
+        self.recovery_status_total_clients.clear();
+        self.ost_stats.clear();
+        self.ost_io_stats.clear();
+        self.ost_create_stats.clear();
+        self.changelog_current_index.clear();
+        self.changelog_user_index.clear();
+        self.changelog_user_idle_sec.clear();
+    }
+
     pub fn register_metric(&self, registry: &mut Registry) {
         registry.register_without_auto_suffix(
             "lustre_disk_io_total",

@@ -11,7 +11,7 @@ use axum::{
     BoxError, Router,
     body::Body,
     error_handling::HandleErrorLayer,
-    extract::Query,
+    extract::{Query, State},
     http::{StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::get,
@@ -22,8 +22,9 @@ use serde::Deserialize;
 use std::{
     borrow::Cow,
     io::{self, BufRead as _, BufReader},
+    sync::Arc,
 };
-use tokio::process::Command;
+use tokio::{process::Command, sync::Mutex};
 use tower::{
     ServiceBuilder, limit::GlobalConcurrencyLimitLayer, load_shed::LoadShedLayer,
     timeout::TimeoutLayer,
@@ -39,7 +40,40 @@ pub struct Params {
 
 const TIMEOUT_DURATION_SECS: u64 = 120;
 
+/// Shared application state holding persistent metrics and registry.
+///
+/// `Family::clone()` shares the backing `Arc<RwLock<BTreeMap>>`, so the
+/// `Registry` and `Metrics`/`JobstatMetrics` reference the same live data.
+/// On each scrape we `clear()` all families, re-populate from fresh data,
+/// and encode from the persistent `Registry`. Empty families are skipped
+/// by the encoder, so jobstat descriptors only appear when populated.
+#[derive(Clone)]
+pub struct AppState {
+    registry: Arc<Registry>,
+    metrics: Arc<Mutex<Metrics>>,
+    jobstat_metrics: Arc<JobstatMetrics>,
+    encode_buffer: Arc<Mutex<String>>,
+}
+
 pub fn app() -> Router {
+    let mut registry = Registry::default();
+    let metrics = Metrics::default();
+    let jobstat_metrics = JobstatMetrics::default();
+
+    // Register all metric families once. The Registry holds Arc clones
+    // that share the same backing BTreeMaps as our Metrics structs.
+    // Order matters: jobstats first, standard metrics second, to match
+    // the original per-scrape registration order.
+    jobstat_metrics.register_metric(&mut registry);
+    metrics.register_metric(&mut registry);
+
+    let state = AppState {
+        registry: Arc::new(registry),
+        metrics: Arc::new(Mutex::new(metrics)),
+        jobstat_metrics: Arc::new(jobstat_metrics),
+        encode_buffer: Arc::new(Mutex::new(String::new())),
+    };
+
     let load_shedder = ServiceBuilder::new()
         .layer(HandleErrorLayer::new(handle_error))
         .layer(LoadShedLayer::new())
@@ -52,6 +86,7 @@ pub fn app() -> Router {
     Router::new()
         .route("/metrics", get(scrape))
         .layer(load_shedder)
+        .with_state(state)
 }
 
 pub async fn handle_error(error: BoxError) -> impl IntoResponse {
@@ -116,41 +151,31 @@ pub fn lnet_stats_output() -> Command {
 /// It orchestrates the collection of both standard Lustre statistics and optional
 /// jobstats data based on query parameters.
 ///
-/// # Arguments
+/// # Architecture
 ///
-/// * `Query(params)` - Query parameters extracted from the HTTP request
-/// * `State(state)` - Shared application state containing the command handler
+/// Uses a persistent `Registry` and `Metrics` struct (via `AppState`) that are
+/// initialized once at startup. On each scrape:
 ///
-/// # Query Parameters
+/// 1. **Clear**: Calls `clear()` on all `Family` maps to drop stale entries
+/// 2. **Collect**: Spawns subprocesses to gather fresh Lustre/LNet data
+/// 3. **Populate**: Re-populates the cleared families with new metric values
+/// 4. **Encode**: Encodes from the persistent `Registry` into a reused buffer
 ///
-/// * `jobstats` - Optional boolean parameter to enable jobstats collection
-///   (e.g., `/metrics?jobstats=true`)
-///
-/// # Returns
-///
-/// * `Ok(Response<Body>)` - HTTP response with Prometheus-formatted metrics
-/// * `Err(Error)` - Error if metric collection or formatting fails
-///
-/// # Processing Flow
-///
-/// 1. **Initialize**: Creates a new Prometheus registry and default metrics structures
-/// 2. **Conditional Jobstats**: If `jobstats=true`, collects and registers jobstats metrics
-/// 3. **Standard Metrics**: Always collects standard Lustre and LNet statistics
-/// 4. **Registration**: Registers all populated metrics with the registry
-/// 5. **Encoding**: Encodes metrics in Prometheus text format
-/// 6. **Response**: Returns HTTP 200 response with metrics as body
-///
-/// # Performance Considerations
-///
-/// - Jobstats collection can be resource-intensive and is optional but will
-///   be run within a spawned task.
-/// - Standard metrics collection runs commands concurrently for efficiency
-/// - Only metrics with actual data are registered to keep output clean
-pub async fn scrape(Query(params): Query<Params>) -> Result<Response<Body>, Error> {
-    let mut registry = Registry::default();
-
-    // Build the lustre stats
-    let mut opentelemetry_metrics = Metrics::default();
+/// Since `Family::clone()` shares the backing `Arc<RwLock<BTreeMap>>`, the
+/// `Registry` automatically sees updates made through the `Metrics` struct.
+/// Empty families are skipped by the encoder.
+pub async fn scrape(
+    State(state): State<AppState>,
+    Query(params): Query<Params>,
+) -> Result<Response<Body>, Error> {
+    // Clear all family maps from the previous scrape.
+    // The Registry still holds Arc references to these same families,
+    // so it will encode whatever we populate below.
+    {
+        let metrics = state.metrics.lock().await;
+        metrics.clear();
+    }
+    state.jobstat_metrics.clear();
 
     if params.jobstats {
         let child = tokio::task::spawn_blocking(move || {
@@ -187,11 +212,13 @@ pub async fn scrape(Query(params): Query<Params>) -> Result<Response<Body>, Erro
                     }
                 });
 
-                let handle = jobstats_stream(reader, JobstatMetrics::default());
+                // Clone shares the Arc-backed Family maps, so updates
+                // made by jobstats_stream are visible to the Registry.
+                let jobstat_clone = (*state.jobstat_metrics).clone();
+                let handle = jobstats_stream(reader, jobstat_clone);
 
-                let metrics = handle.await?;
-
-                metrics.register_metric(&mut registry);
+                // Wait for the stream to finish populating metrics.
+                let _metrics = handle.await?;
             }
             Err(e) => {
                 tracing::debug!("Error while spawning lctl jobstats: {e}");
@@ -219,12 +246,17 @@ pub async fn scrape(Query(params): Query<Params>) -> Result<Response<Body>, Erro
 
     output.append(&mut lnetctl_stats_record);
 
-    // Build and register Lustre metrics
-    metrics::build_lustre_stats(&output, &mut opentelemetry_metrics);
-    opentelemetry_metrics.register_metric(&mut registry);
+    // Build Lustre metrics into the persistent (but cleared) families.
+    // No re-registration needed — the Registry already references them.
+    {
+        let mut metrics = state.metrics.lock().await;
+        metrics::build_lustre_stats(&output, &mut metrics);
+    }
 
-    let mut buffer = String::new();
-    encode(&mut buffer, &registry)?;
+    // Re-use the encode buffer across scrapes to avoid re-growing.
+    let mut buffer = state.encode_buffer.lock().await;
+    buffer.clear();
+    encode(&mut *buffer, &state.registry)?;
 
     let resp = Response::builder()
         .status(StatusCode::OK)
@@ -232,7 +264,7 @@ pub async fn scrape(Query(params): Query<Params>) -> Result<Response<Body>, Erro
             CONTENT_TYPE,
             "application/openmetrics-text; version=1.0.0; charset=utf-8",
         )
-        .body(Body::from(buffer))?;
+        .body(Body::from(buffer.clone()))?;
 
     Ok(resp)
 }
