@@ -23,6 +23,7 @@ use std::{
     borrow::Cow,
     io::{self, BufRead as _, BufReader},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio::process::Command;
 use tower::{
@@ -39,22 +40,57 @@ pub struct Params {
 }
 
 const TIMEOUT_DURATION_SECS: u64 = 120;
+const DEFAULT_CACHE_TTL_SECS: u64 = 5;
+const DEFAULT_SUBPROCESS_TIMEOUT_SECS: u64 = 30;
 
-/// Shared application state holding persistent metrics and registry.
+/// Cached scrape response to avoid running duplicate subprocesses.
+struct CachedResponse {
+    body: String,
+    generated_at: Instant,
+    had_jobstats: bool,
+}
+
+/// Configuration passed from CLI to the application.
+#[derive(Clone, Debug)]
+pub struct AppConfig {
+    pub cache_ttl: Duration,
+    pub subprocess_timeout: Duration,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            cache_ttl: Duration::from_secs(DEFAULT_CACHE_TTL_SECS),
+            subprocess_timeout: Duration::from_secs(DEFAULT_SUBPROCESS_TIMEOUT_SECS),
+        }
+    }
+}
+
+/// Shared application state holding persistent metrics, registry, and response cache.
 ///
 /// `Family::clone()` shares the backing `Arc<RwLock<BTreeMap>>`, so the
 /// `Registry` and `Metrics`/`JobstatMetrics` reference the same live data.
 /// On each scrape we `clear()` all families, re-populate from fresh data,
 /// and encode from the persistent `Registry`. Empty families are skipped
 /// by the encoder, so jobstat descriptors only appear when populated.
+///
+/// The `cache` field holds the last encoded response behind a `tokio::sync::RwLock`.
+/// Concurrent scrapes coalesce: only the first request finding stale data acquires
+/// the write lock and runs subprocesses; others block and then see the fresh result.
 #[derive(Clone)]
 pub struct AppState {
     registry: Arc<Registry>,
     metrics: Arc<Metrics>,
     jobstat_metrics: Arc<JobstatMetrics>,
+    cache: Arc<tokio::sync::RwLock<Option<CachedResponse>>>,
+    config: AppConfig,
 }
 
 pub fn app() -> Router {
+    app_with_config(AppConfig::default())
+}
+
+pub fn app_with_config(config: AppConfig) -> Router {
     let mut registry = Registry::default();
     let metrics = Metrics::default();
     let jobstat_metrics = JobstatMetrics::default();
@@ -66,10 +102,18 @@ pub fn app() -> Router {
     jobstat_metrics.register_metric(&mut registry);
     metrics.register_metric(&mut registry);
 
+    tracing::info!(
+        cache_ttl_secs = config.cache_ttl.as_secs(),
+        subprocess_timeout_secs = config.subprocess_timeout.as_secs(),
+        "Exporter configuration"
+    );
+
     let state = AppState {
         registry: Arc::new(registry),
         metrics: Arc::new(metrics),
         jobstat_metrics: Arc::new(jobstat_metrics),
+        cache: Arc::new(tokio::sync::RwLock::new(None)),
+        config,
     };
 
     let load_shedder = ServiceBuilder::new()
@@ -144,108 +188,179 @@ pub fn lnet_stats_output() -> Command {
 
 /// Main metrics scraping endpoint handler for the Prometheus exporter.
 ///
-/// This function serves as the primary HTTP handler for the `/metrics` endpoint,
-/// collecting and formatting Lustre filesystem metrics in Prometheus format.
-/// It orchestrates the collection of both standard Lustre statistics and optional
-/// jobstats data based on query parameters.
+/// Uses a response cache with double-check RwLock pattern to coalesce
+/// concurrent scrapes. Only one request does real subprocess work; others
+/// block and serve the result.
 ///
-/// # Architecture
-///
-/// Uses a persistent `Registry` and `Metrics` struct (via `AppState`) that are
-/// initialized once at startup. On each scrape:
-///
-/// 1. **Clear**: Calls `clear()` on all `Family` maps to drop stale entries
-/// 2. **Collect**: Spawns subprocesses to gather fresh Lustre/LNet data
-/// 3. **Populate**: Re-populates the cleared families with new metric values
-/// 4. **Encode**: Encodes from the persistent `Registry` into a reused buffer
-///
-/// Since `Family::clone()` shares the backing `Arc<RwLock<BTreeMap>>`, the
-/// `Registry` automatically sees updates made through the `Metrics` struct.
-/// Empty families are skipped by the encoder.
+/// Each subprocess is wrapped with `tokio::time::timeout` to kill hung
+/// `lctl`/`lnetctl` processes. On timeout or error, the scrape continues
+/// with partial data — Prometheus handles missing metrics gracefully.
 pub async fn scrape(
     State(state): State<AppState>,
     Query(params): Query<Params>,
 ) -> Result<Response<Body>, Error> {
-    // Families were cleared by the previous scrape (or start empty on first run).
-    // The Registry holds Arc references to these same families,
-    // so it will encode whatever we populate below.
+    let cache_ttl = state.config.cache_ttl;
+
+    // Fast path: serve cached response if fresh and matches jobstats param.
+    {
+        let cache = state.cache.read().await;
+        if let Some(ref cached) = *cache {
+            if cached.generated_at.elapsed() < cache_ttl && cached.had_jobstats == params.jobstats {
+                tracing::debug!(
+                    age_ms = cached.generated_at.elapsed().as_millis() as u64,
+                    "Serving cached response"
+                );
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(
+                        CONTENT_TYPE,
+                        "application/openmetrics-text; version=1.0.0; charset=utf-8",
+                    )
+                    .body(Body::from(cached.body.clone()))?);
+            }
+        }
+    }
+    // Read lock is dropped here.
+
+    // Slow path: acquire write lock, double-check, then scrape.
+    let mut cache = state.cache.write().await;
+
+    // Double-check: another request may have refreshed while we waited.
+    if let Some(ref cached) = *cache {
+        if cached.generated_at.elapsed() < cache_ttl && cached.had_jobstats == params.jobstats {
+            tracing::debug!("Cache refreshed by another request while waiting for write lock");
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    "application/openmetrics-text; version=1.0.0; charset=utf-8",
+                )
+                .body(Body::from(cached.body.clone()))?);
+        }
+    }
+
+    // We hold the write lock — only this request does real work.
+    // All other concurrent requests are blocked on the write lock
+    // and will see our result when we release it.
+    let subprocess_timeout = state.config.subprocess_timeout;
 
     if params.jobstats {
-        let child = tokio::task::spawn_blocking(move || {
-            let child = jobstats_metrics_cmd().spawn()?;
+        match tokio::time::timeout(subprocess_timeout, async {
+            let child = tokio::task::spawn_blocking(move || {
+                let child = jobstats_metrics_cmd().spawn()?;
+                Ok::<_, Error>(child)
+            })
+            .await?;
 
-            Ok::<_, Error>(child)
-        })
-        .await?;
+            match child {
+                Ok(mut child) => {
+                    let reader = BufReader::with_capacity(
+                        128 * 1_024,
+                        child.stdout.take().ok_or(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "stdout missing for lctl jobstats call.",
+                        ))?,
+                    );
 
-        match child {
-            Ok(mut child) => {
-                let reader = BufReader::with_capacity(
-                    128 * 1_024,
-                    child.stdout.take().ok_or(io::Error::new(
+                    let reader_stderr = BufReader::new(child.stderr.take().ok_or(io::Error::new(
                         io::ErrorKind::NotFound,
-                        "stdout missing for lctl jobstats call.",
-                    ))?,
-                );
+                        "stderr missing for lctl jobstats call.",
+                    ))?);
 
-                let reader_stderr = BufReader::new(child.stderr.take().ok_or(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "stderr missing for lctl jobstats call.",
-                ))?);
+                    tokio::task::spawn(async move {
+                        for line in reader_stderr.lines().map_while(Result::ok) {
+                            tracing::debug!("stderr: {line}");
+                        }
+                    });
 
-                tokio::task::spawn(async move {
-                    for line in reader_stderr.lines().map_while(Result::ok) {
-                        tracing::debug!("stderr: {line}");
-                    }
-                });
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = child.wait() {
+                            tracing::debug!("Unexpected error when waiting for child: {e}");
+                        }
+                    });
 
-                tokio::task::spawn_blocking(move || {
-                    if let Err(e) = child.wait() {
-                        tracing::debug!("Unexpected error when waiting for child: {e}");
-                    }
-                });
-
-                // Clone shares the Arc-backed Family maps, so updates
-                // made by jobstats_stream are visible to the Registry.
-                let jobstat_clone = (*state.jobstat_metrics).clone();
-                let handle = jobstats_stream(reader, jobstat_clone);
-
-                // Wait for the stream to finish populating metrics.
-                let _metrics = handle.await?;
+                    let jobstat_clone = (*state.jobstat_metrics).clone();
+                    let handle = jobstats_stream(reader, jobstat_clone);
+                    let _metrics = handle.await?;
+                }
+                Err(e) => {
+                    tracing::debug!("Error while spawning lctl jobstats: {e}");
+                }
             }
-            Err(e) => {
-                tracing::debug!("Error while spawning lctl jobstats: {e}");
+            Ok::<_, Error>(())
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("lctl jobstats failed: {e}");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = subprocess_timeout.as_secs(),
+                    "lctl jobstats timed out — skipping jobstats for this scrape"
+                );
             }
         }
     }
 
     let mut output = vec![];
 
-    let lctl = lustre_metrics_output().output().await?;
+    // lctl get_param (Lustre metrics)
+    match tokio::time::timeout(subprocess_timeout, lustre_metrics_output().output()).await {
+        Ok(Ok(lctl)) => match parse_lctl_output(&lctl.stdout) {
+            Ok(mut lctl_output) => output.append(&mut lctl_output),
+            Err(e) => tracing::warn!("Failed to parse lctl output: {e}"),
+        },
+        Ok(Err(e)) => tracing::warn!("lctl get_param failed: {e}"),
+        Err(_) => tracing::warn!(
+            timeout_secs = subprocess_timeout.as_secs(),
+            "lctl get_param timed out"
+        ),
+    }
 
-    let mut lctl_output = parse_lctl_output(&lctl.stdout)?;
+    // lnetctl net show
+    match tokio::time::timeout(subprocess_timeout, net_show_output().output()).await {
+        Ok(Ok(lnetctl)) => match parse_lnetctl_output(&lnetctl.stdout) {
+            Ok(mut lnetctl_output) => output.append(&mut lnetctl_output),
+            Err(e) => tracing::warn!("Failed to parse lnetctl net show output: {e}"),
+        },
+        Ok(Err(e)) => tracing::warn!("lnetctl net show failed: {e}"),
+        Err(_) => tracing::warn!(
+            timeout_secs = subprocess_timeout.as_secs(),
+            "lnetctl net show timed out"
+        ),
+    }
 
-    output.append(&mut lctl_output);
-
-    let lnetctl = net_show_output().output().await?;
-
-    let mut lnetctl_output = parse_lnetctl_output(&lnetctl.stdout)?;
-
-    output.append(&mut lnetctl_output);
-
-    let lnetctl_stats_output = lnet_stats_output().output().await?;
-
-    let mut lnetctl_stats_record = parse_lnetctl_stats(&lnetctl_stats_output.stdout)?;
-
-    output.append(&mut lnetctl_stats_record);
+    // lnetctl stats show
+    match tokio::time::timeout(subprocess_timeout, lnet_stats_output().output()).await {
+        Ok(Ok(lnetctl_stats)) => match parse_lnetctl_stats(&lnetctl_stats.stdout) {
+            Ok(mut lnetctl_stats_record) => output.append(&mut lnetctl_stats_record),
+            Err(e) => tracing::warn!("Failed to parse lnetctl stats output: {e}"),
+        },
+        Ok(Err(e)) => tracing::warn!("lnetctl stats show failed: {e}"),
+        Err(_) => tracing::warn!(
+            timeout_secs = subprocess_timeout.as_secs(),
+            "lnetctl stats show timed out"
+        ),
+    }
 
     // Build Lustre metrics into the persistent (but cleared) families.
-    // No re-registration needed — the Registry already references them.
     metrics::build_lustre_stats(&output, &state.metrics);
 
     // Encode from the persistent Registry into a local buffer.
     let mut buffer = String::new();
     encode(&mut buffer, &state.registry)?;
+
+    // Store in cache before clearing (other requests will clone the body).
+    *cache = Some(CachedResponse {
+        body: buffer.clone(),
+        generated_at: Instant::now(),
+        had_jobstats: params.jobstats,
+    });
+
+    // Drop write lock before clearing so waiting requests can serve cached data.
+    drop(cache);
 
     let resp = Response::builder()
         .status(StatusCode::OK)
