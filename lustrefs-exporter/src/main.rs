@@ -14,13 +14,6 @@ pub struct CommandOpts {
     #[clap(short, long, env = "LUSTREFS_EXPORTER_PORT", default_value = LUSTREFS_EXPORTER_PORT)]
     pub port: u16,
 
-    /// Response cache TTL in seconds. Concurrent scrapes within this window
-    /// are served from cache, preventing duplicate subprocess invocations.
-    /// The write-lock coalescing ensures only one scrape runs at a time
-    /// regardless of TTL; this value controls post-scrape staleness tolerance.
-    #[clap(long, env = "LUSTREFS_EXPORTER_CACHE_TTL", default_value = "1")]
-    pub cache_ttl_secs: u64,
-
     /// Timeout in seconds for each subprocess (lctl, lnetctl). If a subprocess
     /// does not complete within this duration it is killed and the scrape
     /// continues with partial data.
@@ -46,7 +39,6 @@ async fn main() -> Result<(), Error> {
         tracing::info!("Listening on http://{addr}/metrics");
 
         let config = AppConfig {
-            cache_ttl: Duration::from_secs(opts.cache_ttl_secs),
             subprocess_timeout: Duration::from_secs(opts.subprocess_timeout_secs),
         };
 

@@ -23,9 +23,9 @@ use std::{
     borrow::Cow,
     io::{self, BufRead as _, BufReader},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::process::Command;
+use tokio::{process::Command, sync::Mutex};
 use tower::{
     ServiceBuilder, limit::GlobalConcurrencyLimitLayer, load_shed::LoadShedLayer,
     timeout::TimeoutLayer,
@@ -40,33 +40,23 @@ pub struct Params {
 }
 
 const TIMEOUT_DURATION_SECS: u64 = 120;
-const DEFAULT_CACHE_TTL_SECS: u64 = 1;
 const DEFAULT_SUBPROCESS_TIMEOUT_SECS: u64 = 30;
-
-/// Cached scrape response to avoid running duplicate subprocesses.
-struct CachedResponse {
-    body: String,
-    generated_at: Instant,
-    had_jobstats: bool,
-}
 
 /// Configuration passed from CLI to the application.
 #[derive(Clone, Debug)]
 pub struct AppConfig {
-    pub cache_ttl: Duration,
     pub subprocess_timeout: Duration,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            cache_ttl: Duration::from_secs(DEFAULT_CACHE_TTL_SECS),
             subprocess_timeout: Duration::from_secs(DEFAULT_SUBPROCESS_TIMEOUT_SECS),
         }
     }
 }
 
-/// Shared application state holding persistent metrics, registry, and response cache.
+/// Shared application state holding persistent metrics, registry, and execution lock.
 ///
 /// `Family::clone()` shares the backing `Arc<RwLock<BTreeMap>>`, so the
 /// `Registry` and `Metrics`/`JobstatMetrics` reference the same live data.
@@ -74,15 +64,13 @@ impl Default for AppConfig {
 /// and encode from the persistent `Registry`. Empty families are skipped
 /// by the encoder, so jobstat descriptors only appear when populated.
 ///
-/// The `cache` field holds the last encoded response behind a `tokio::sync::RwLock`.
-/// Concurrent scrapes coalesce: only the first request finding stale data acquires
-/// the write lock and runs subprocesses; others block and then see the fresh result.
+/// The `lock` field ensures only one scrape runs at a time.
 #[derive(Clone)]
 pub struct AppState {
     registry: Arc<Registry>,
     metrics: Arc<Metrics>,
     jobstat_metrics: Arc<JobstatMetrics>,
-    cache: Arc<tokio::sync::RwLock<Option<CachedResponse>>>,
+    lock: Arc<Mutex<()>>,
     config: AppConfig,
 }
 
@@ -103,7 +91,6 @@ pub fn app_with_config(config: AppConfig) -> Router {
     metrics.register_metric(&mut registry);
 
     tracing::info!(
-        cache_ttl_secs = config.cache_ttl.as_secs(),
         subprocess_timeout_secs = config.subprocess_timeout.as_secs(),
         "Exporter configuration"
     );
@@ -112,7 +99,7 @@ pub fn app_with_config(config: AppConfig) -> Router {
         registry: Arc::new(registry),
         metrics: Arc::new(metrics),
         jobstat_metrics: Arc::new(jobstat_metrics),
-        cache: Arc::new(tokio::sync::RwLock::new(None)),
+        lock: Arc::new(Mutex::new(())),
         config,
     };
 
@@ -188,9 +175,7 @@ pub fn lnet_stats_output() -> Command {
 
 /// Main metrics scraping endpoint handler for the Prometheus exporter.
 ///
-/// Uses a response cache with double-check RwLock pattern to coalesce
-/// concurrent scrapes. Only one request does real subprocess work; others
-/// block and serve the result.
+/// Uses a mutex to ensure only one scrape runs at a time.
 ///
 /// Each subprocess is wrapped with `tokio::time::timeout` to kill hung
 /// `lctl`/`lnetctl` processes. On timeout or error, the scrape continues
@@ -199,49 +184,9 @@ pub async fn scrape(
     State(state): State<AppState>,
     Query(params): Query<Params>,
 ) -> Result<Response<Body>, Error> {
-    let cache_ttl = state.config.cache_ttl;
+    // Acquire the lock to serialize requests.
+    let _guard = state.lock.lock().await;
 
-    // Fast path: serve cached response if fresh and matches jobstats param.
-    {
-        let cache = state.cache.read().await;
-        if let Some(ref cached) = *cache {
-            if cached.generated_at.elapsed() < cache_ttl && cached.had_jobstats == params.jobstats {
-                tracing::debug!(
-                    age_ms = cached.generated_at.elapsed().as_millis() as u64,
-                    "Serving cached response"
-                );
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(
-                        CONTENT_TYPE,
-                        "application/openmetrics-text; version=1.0.0; charset=utf-8",
-                    )
-                    .body(Body::from(cached.body.clone()))?);
-            }
-        }
-    }
-    // Read lock is dropped here.
-
-    // Slow path: acquire write lock, double-check, then scrape.
-    let mut cache = state.cache.write().await;
-
-    // Double-check: another request may have refreshed while we waited.
-    if let Some(ref cached) = *cache {
-        if cached.generated_at.elapsed() < cache_ttl && cached.had_jobstats == params.jobstats {
-            tracing::debug!("Cache refreshed by another request while waiting for write lock");
-            return Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(
-                    CONTENT_TYPE,
-                    "application/openmetrics-text; version=1.0.0; charset=utf-8",
-                )
-                .body(Body::from(cached.body.clone()))?);
-        }
-    }
-
-    // We hold the write lock — only this request does real work.
-    // All other concurrent requests are blocked on the write lock
-    // and will see our result when we release it.
     let subprocess_timeout = state.config.subprocess_timeout;
 
     if params.jobstats {
@@ -306,43 +251,88 @@ pub async fn scrape(
 
     let mut output = vec![];
 
-    // lctl get_param (Lustre metrics)
-    match tokio::time::timeout(subprocess_timeout, lustre_metrics_output().output()).await {
-        Ok(Ok(lctl)) => match parse_lctl_output(&lctl.stdout) {
-            Ok(mut lctl_output) => output.append(&mut lctl_output),
-            Err(e) => tracing::warn!("Failed to parse lctl output: {e}"),
-        },
-        Ok(Err(e)) => tracing::warn!("lctl get_param failed: {e}"),
-        Err(_) => tracing::warn!(
-            timeout_secs = subprocess_timeout.as_secs(),
-            "lctl get_param timed out"
-        ),
-    }
+    // Functions to run subprocesses and return Result<Vec<Record>, _>
+    let run_lustre_metrics = async {
+        match tokio::time::timeout(subprocess_timeout, lustre_metrics_output().output()).await {
+            Ok(Ok(output)) => match parse_lctl_output(&output.stdout) {
+                Ok(records) => Ok::<_, Error>(records),
+                Err(e) => {
+                    tracing::warn!("Failed to parse lctl output: {e}");
+                    Ok(vec![])
+                }
+            },
+            Ok(Err(e)) => {
+                tracing::warn!("lctl get_param failed: {e}");
+                Ok(vec![])
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = subprocess_timeout.as_secs(),
+                    "lctl get_param timed out"
+                );
+                Ok(vec![])
+            }
+        }
+    };
 
-    // lnetctl net show
-    match tokio::time::timeout(subprocess_timeout, net_show_output().output()).await {
-        Ok(Ok(lnetctl)) => match parse_lnetctl_output(&lnetctl.stdout) {
-            Ok(mut lnetctl_output) => output.append(&mut lnetctl_output),
-            Err(e) => tracing::warn!("Failed to parse lnetctl net show output: {e}"),
-        },
-        Ok(Err(e)) => tracing::warn!("lnetctl net show failed: {e}"),
-        Err(_) => tracing::warn!(
-            timeout_secs = subprocess_timeout.as_secs(),
-            "lnetctl net show timed out"
-        ),
-    }
+    let run_net_show = async {
+        match tokio::time::timeout(subprocess_timeout, net_show_output().output()).await {
+            Ok(Ok(output)) => match parse_lnetctl_output(&output.stdout) {
+                Ok(records) => Ok::<_, Error>(records),
+                Err(e) => {
+                    tracing::warn!("Failed to parse lnetctl net show output: {e}");
+                    Ok(vec![])
+                }
+            },
+            Ok(Err(e)) => {
+                tracing::warn!("lnetctl net show failed: {e}");
+                Ok(vec![])
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = subprocess_timeout.as_secs(),
+                    "lnetctl net show timed out"
+                );
+                Ok(vec![])
+            }
+        }
+    };
 
-    // lnetctl stats show
-    match tokio::time::timeout(subprocess_timeout, lnet_stats_output().output()).await {
-        Ok(Ok(lnetctl_stats)) => match parse_lnetctl_stats(&lnetctl_stats.stdout) {
-            Ok(mut lnetctl_stats_record) => output.append(&mut lnetctl_stats_record),
-            Err(e) => tracing::warn!("Failed to parse lnetctl stats output: {e}"),
-        },
-        Ok(Err(e)) => tracing::warn!("lnetctl stats show failed: {e}"),
-        Err(_) => tracing::warn!(
-            timeout_secs = subprocess_timeout.as_secs(),
-            "lnetctl stats show timed out"
-        ),
+    let run_lnet_stats = async {
+        match tokio::time::timeout(subprocess_timeout, lnet_stats_output().output()).await {
+            Ok(Ok(output)) => match parse_lnetctl_stats(&output.stdout) {
+                Ok(records) => Ok::<_, Error>(records),
+                Err(e) => {
+                    tracing::warn!("Failed to parse lnetctl stats output: {e}");
+                    Ok(vec![])
+                }
+            },
+            Ok(Err(e)) => {
+                tracing::warn!("lnetctl stats show failed: {e}");
+                Ok(vec![])
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = subprocess_timeout.as_secs(),
+                    "lnetctl stats show timed out"
+                );
+                Ok(vec![])
+            }
+        }
+    };
+
+    // Run all subprocesses in parallel
+    let (lustre_records, net_records, stats_records) =
+        tokio::join!(run_lustre_metrics, run_net_show, run_lnet_stats);
+
+    if let Ok(mut records) = lustre_records {
+        output.append(&mut records);
+    }
+    if let Ok(mut records) = net_records {
+        output.append(&mut records);
+    }
+    if let Ok(mut records) = stats_records {
+        output.append(&mut records);
     }
 
     // Build Lustre metrics into the persistent (but cleared) families.
@@ -351,16 +341,6 @@ pub async fn scrape(
     // Encode from the persistent Registry into a local buffer.
     let mut buffer = String::new();
     encode(&mut buffer, &state.registry)?;
-
-    // Store in cache before clearing (other requests will clone the body).
-    *cache = Some(CachedResponse {
-        body: buffer.clone(),
-        generated_at: Instant::now(),
-        had_jobstats: params.jobstats,
-    });
-
-    // Drop write lock before clearing so waiting requests can serve cached data.
-    drop(cache);
 
     let resp = Response::builder()
         .status(StatusCode::OK)
