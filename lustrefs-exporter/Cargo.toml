@@ -5,8 +5,10 @@ name = "lustrefs-exporter"
 version.workspace = true
 
 [dependencies]
+async-stream = "0.3.6"
 axum = { workspace = true, features = ["http2"] }
 clap = { workspace = true, features = ["derive", "env", "wrap_help", "string"] }
+futures-core = "0.3.31"
 lustre_collector.path = "../lustre-collector"
 prometheus-client.workspace = true
 regex = { version = "1", default-features = false, features = [
