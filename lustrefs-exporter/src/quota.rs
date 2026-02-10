@@ -58,7 +58,7 @@ impl QuotaMetrics {
     }
 }
 
-pub fn build_quota_stats(x: &TargetQuotaStat<QuotaStats>, quota: &mut QuotaMetrics) {
+pub fn build_quota_stats(x: &TargetQuotaStat<QuotaStats>, quota: &QuotaMetrics) {
     let TargetQuotaStat {
         target,
         value,
@@ -97,7 +97,7 @@ pub fn build_quota_stats(x: &TargetQuotaStat<QuotaStats>, quota: &mut QuotaMetri
     }
 }
 
-pub fn build_ost_quota_stats(x: &TargetStat<QuotaStatsOsd>, quota: &mut QuotaMetrics) {
+pub fn build_ost_quota_stats(x: &TargetStat<QuotaStatsOsd>, quota: &QuotaMetrics) {
     let TargetStat {
         kind,
         target,

@@ -311,7 +311,7 @@ impl BrwStatsMetrics {
 
 fn build_brw_stats(
     x: &TargetStat<Vec<BrwStats>>,
-    brw: &mut BrwStatsMetrics,
+    brw: &BrwStatsMetrics,
     set: &mut HashSet<(String, String, String, String)>,
 ) {
     let TargetStat {
@@ -419,7 +419,7 @@ fn build_brw_stats(
     }
 }
 
-fn build_oss_stats(x: &OssStat, brw: &mut BrwStatsMetrics) {
+fn build_oss_stats(x: &OssStat, brw: &BrwStatsMetrics) {
     let OssStat { param, stats } = x;
 
     for x in stats {
@@ -444,7 +444,7 @@ fn build_oss_stats(x: &OssStat, brw: &mut BrwStatsMetrics) {
     }
 }
 
-fn build_changelog_stats(x: &TargetStat<ChangelogStat>, brw: &mut BrwStatsMetrics) {
+fn build_changelog_stats(x: &TargetStat<ChangelogStat>, brw: &BrwStatsMetrics) {
     let TargetStat { target, value, .. } = x;
 
     let ChangelogStat {
@@ -478,15 +478,15 @@ fn build_changelog_stats(x: &TargetStat<ChangelogStat>, brw: &mut BrwStatsMetric
 
 pub fn build_target_stats(
     x: &TargetStats,
-    metrics: &mut Metrics,
+    metrics: &Metrics,
     set: &mut HashSet<(String, String, String, String)>,
 ) {
     match x {
         TargetStats::Stats(x) => {
-            build_stats(x, &mut metrics.stats);
+            build_stats(x, &metrics.stats);
         }
         TargetStats::BrwStats(x) => {
-            build_brw_stats(x, &mut metrics.brw, set);
+            build_brw_stats(x, &metrics.brw, set);
         }
         TargetStats::FilesFree(x) => {
             metrics
@@ -628,7 +628,7 @@ pub fn build_target_stats(
                 ])
                 .inc_by(x.value);
         }
-        TargetStats::Llite(x) => build_llite_stats(x, &mut metrics.llite),
+        TargetStats::Llite(x) => build_llite_stats(x, &metrics.llite),
         TargetStats::RecoveryStatus(x) => {
             metrics
                 .brw
@@ -700,17 +700,17 @@ pub fn build_target_stats(
                 .set(x.value);
         }
         TargetStats::ExportStats(x) => {
-            build_export_stats(x, &mut metrics.export);
+            build_export_stats(x, &metrics.export);
         }
         TargetStats::QuotaStats(x) => {
-            build_quota_stats(x, &mut metrics.quota);
+            build_quota_stats(x, &metrics.quota);
         }
         TargetStats::QuotaStatsOsd(x) => {
-            build_ost_quota_stats(x, &mut metrics.quota);
+            build_ost_quota_stats(x, &metrics.quota);
         }
-        TargetStats::Oss(x) => build_oss_stats(x, &mut metrics.brw),
-        TargetStats::Changelog(x) => build_changelog_stats(x, &mut metrics.brw),
-        TargetStats::Mds(x) => build_mds_stats(x, &mut metrics.mds),
+        TargetStats::Oss(x) => build_oss_stats(x, &metrics.brw),
+        TargetStats::Changelog(x) => build_changelog_stats(x, &metrics.brw),
+        TargetStats::Mds(x) => build_mds_stats(x, &metrics.mds),
         _ => {}
     };
 }

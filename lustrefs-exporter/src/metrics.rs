@@ -61,23 +61,23 @@ impl Metrics {
     }
 }
 
-pub fn build_lustre_stats(output: &Vec<Record>, metrics: &mut Metrics) {
+pub fn build_lustre_stats(output: &Vec<Record>, metrics: &Metrics) {
     // This set is used to store the possible duplicate target stats
     let mut set = HashSet::new();
 
     for x in output {
         match x {
             lustre_collector::Record::Host(x) => {
-                build_host_stats(x, &mut metrics.host);
+                build_host_stats(x, &metrics.host);
             }
             lustre_collector::Record::LNetStat(x) => {
-                build_lnet_stats(x, &mut metrics.lnet);
+                build_lnet_stats(x, &metrics.lnet);
             }
             lustre_collector::Record::Target(x) => {
                 build_target_stats(x, metrics, &mut set);
             }
             lustre_collector::Record::LustreService(x) => {
-                build_service_stats(x, &mut metrics.service);
+                build_service_stats(x, &metrics.service);
             }
             _ => {}
         }

@@ -26,7 +26,7 @@ impl LliteMetrics {
     }
 }
 
-pub fn build_llite_stats(x: &LliteStat, metrics: &mut LliteMetrics) {
+pub fn build_llite_stats(x: &LliteStat, metrics: &LliteMetrics) {
     let LliteStat {
         target,
         param: _,

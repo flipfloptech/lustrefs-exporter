@@ -24,7 +24,7 @@ use std::{
     io::{self, BufRead as _, BufReader},
     sync::Arc,
 };
-use tokio::{process::Command, sync::Mutex};
+use tokio::process::Command;
 use tower::{
     ServiceBuilder, limit::GlobalConcurrencyLimitLayer, load_shed::LoadShedLayer,
     timeout::TimeoutLayer,
@@ -50,9 +50,8 @@ const TIMEOUT_DURATION_SECS: u64 = 120;
 #[derive(Clone)]
 pub struct AppState {
     registry: Arc<Registry>,
-    metrics: Arc<Mutex<Metrics>>,
+    metrics: Arc<Metrics>,
     jobstat_metrics: Arc<JobstatMetrics>,
-    encode_buffer: Arc<Mutex<String>>,
 }
 
 pub fn app() -> Router {
@@ -69,9 +68,8 @@ pub fn app() -> Router {
 
     let state = AppState {
         registry: Arc::new(registry),
-        metrics: Arc::new(Mutex::new(metrics)),
+        metrics: Arc::new(metrics),
         jobstat_metrics: Arc::new(jobstat_metrics),
-        encode_buffer: Arc::new(Mutex::new(String::new())),
     };
 
     let load_shedder = ServiceBuilder::new()
@@ -168,14 +166,9 @@ pub async fn scrape(
     State(state): State<AppState>,
     Query(params): Query<Params>,
 ) -> Result<Response<Body>, Error> {
-    // Clear all family maps from the previous scrape.
-    // The Registry still holds Arc references to these same families,
+    // Families were cleared by the previous scrape (or start empty on first run).
+    // The Registry holds Arc references to these same families,
     // so it will encode whatever we populate below.
-    {
-        let metrics = state.metrics.lock().await;
-        metrics.clear();
-    }
-    state.jobstat_metrics.clear();
 
     if params.jobstats {
         let child = tokio::task::spawn_blocking(move || {
@@ -248,15 +241,11 @@ pub async fn scrape(
 
     // Build Lustre metrics into the persistent (but cleared) families.
     // No re-registration needed — the Registry already references them.
-    {
-        let mut metrics = state.metrics.lock().await;
-        metrics::build_lustre_stats(&output, &mut metrics);
-    }
+    metrics::build_lustre_stats(&output, &state.metrics);
 
-    // Re-use the encode buffer across scrapes to avoid re-growing.
-    let mut buffer = state.encode_buffer.lock().await;
-    buffer.clear();
-    encode(&mut *buffer, &state.registry)?;
+    // Encode from the persistent Registry into a local buffer.
+    let mut buffer = String::new();
+    encode(&mut buffer, &state.registry)?;
 
     let resp = Response::builder()
         .status(StatusCode::OK)
@@ -264,7 +253,12 @@ pub async fn scrape(
             CONTENT_TYPE,
             "application/openmetrics-text; version=1.0.0; charset=utf-8",
         )
-        .body(Body::from(buffer.clone()))?;
+        .body(Body::from(buffer))?;
+
+    // Clear families AFTER encoding so the deallocation cost
+    // doesn't block response generation. Next scrape starts fresh.
+    state.metrics.clear();
+    state.jobstat_metrics.clear();
 
     Ok(resp)
 }

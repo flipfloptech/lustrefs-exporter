@@ -252,7 +252,7 @@ impl StatsMetrics {
     }
 }
 
-pub fn build_ost_stats(stats: &[Stat], target: &Target, metrics: &mut StatsMetrics) {
+pub fn build_ost_stats(stats: &[Stat], target: &Target, metrics: &StatsMetrics) {
     let kind = TargetVariant::Ost;
 
     for s in stats {
@@ -391,7 +391,7 @@ pub fn build_ost_stats(stats: &[Stat], target: &Target, metrics: &mut StatsMetri
     }
 }
 
-pub fn build_mdt_stats(stats: &[Stat], target: &Target, metrics: &mut StatsMetrics) {
+pub fn build_mdt_stats(stats: &[Stat], target: &Target, metrics: &StatsMetrics) {
     let kind = TargetVariant::Mdt;
 
     for s in stats {
@@ -415,7 +415,7 @@ pub fn build_mdt_stats(stats: &[Stat], target: &Target, metrics: &mut StatsMetri
     }
 }
 
-pub fn build_stats(x: &TargetStat<Vec<Stat>>, stats: &mut StatsMetrics) {
+pub fn build_stats(x: &TargetStat<Vec<Stat>>, stats: &StatsMetrics) {
     let TargetStat {
         kind,
         target,
@@ -430,7 +430,7 @@ pub fn build_stats(x: &TargetStat<Vec<Stat>>, stats: &mut StatsMetrics) {
     }
 }
 
-pub fn build_mds_stats(x: &MdsStat, metrics: &mut StatsMetrics) {
+pub fn build_mds_stats(x: &MdsStat, metrics: &StatsMetrics) {
     let MdsStat { param, stats } = x;
 
     for stat in stats {
@@ -485,7 +485,7 @@ pub fn build_mds_stats(x: &MdsStat, metrics: &mut StatsMetrics) {
     }
 }
 
-pub fn build_export_stats(x: &TargetStat<Vec<ExportStats>>, metrics: &mut StatsMetrics) {
+pub fn build_export_stats(x: &TargetStat<Vec<ExportStats>>, metrics: &StatsMetrics) {
     let TargetStat {
         kind,
         target,

@@ -34,7 +34,7 @@ impl ServiceMetrics {
     }
 }
 
-pub fn build_service_stats(x: &LustreServiceStats, service: &mut ServiceMetrics) {
+pub fn build_service_stats(x: &LustreServiceStats, service: &ServiceMetrics) {
     match x {
         LustreServiceStats::LdlmCanceld(xs) => {
             for s in xs {

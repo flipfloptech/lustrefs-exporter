@@ -53,7 +53,7 @@ impl HostMetrics {
     }
 }
 
-pub fn build_host_stats(stats: &HostStats, metrics: &mut HostMetrics) {
+pub fn build_host_stats(stats: &HostStats, metrics: &HostMetrics) {
     match stats {
         HostStats::HealthCheck(x) => {
             let healthy = x.value.healthy;
