@@ -105,6 +105,9 @@ pub fn build_ost_quota_stats(x: &TargetStat<QuotaStatsOsd>, quota: &QuotaMetrics
         ..
     } = x;
 
+    let component = kind.to_prom_label().to_string();
+    let target_str = target.to_string();
+
     for s in &value.stats {
         let accounting = match value.kind {
             lustre_collector::QuotaKind::Usr => "user",
@@ -114,9 +117,9 @@ pub fn build_ost_quota_stats(x: &TargetStat<QuotaStatsOsd>, quota: &QuotaMetrics
 
         let label = vec![
             ("accounting", accounting.to_string()),
-            ("component", kind.to_prom_label().to_string()),
+            ("component", component.clone()),
             ("id", s.id.to_string()),
-            ("target", target.to_string()),
+            ("target", target_str.clone()),
         ];
 
         quota

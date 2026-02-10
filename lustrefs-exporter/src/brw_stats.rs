@@ -10,7 +10,8 @@ use crate::{
     stats::{build_export_stats, build_mds_stats, build_stats},
 };
 use lustre_collector::{
-    BrwStats, ChangeLogUser, ChangelogStat, OssStat, Stat, TargetStat, TargetStats,
+    BrwStats, ChangeLogUser, ChangelogStat, OssStat, Stat, Target, TargetStat, TargetStats,
+    TargetVariant,
 };
 use prometheus_client::{
     metrics::{counter::Counter, gauge::Gauge},
@@ -321,32 +322,35 @@ fn build_brw_stats(
         ..
     } = x;
 
+    let component = kind.to_prom_label().to_string();
+    let target_str = target.to_string();
+
     for x in value {
         let BrwStats { name, buckets, .. } = x;
 
         for b in buckets {
             let size = b.name.to_string();
 
-            let labels = vec![
-                ("component", kind.to_prom_label().to_string()),
-                ("operation", "read".into()),
-                ("size", size.clone()),
-                ("target", target.to_string()),
-            ];
-
-            let write_labels = vec![
-                ("component", kind.to_prom_label().to_string()),
-                ("operation", "write".into()),
-                ("size", size.clone()),
-                ("target", target.to_string()),
-            ];
-
             if set.insert((
-                kind.to_prom_label().to_string(),
-                target.to_string(),
+                component.clone(),
+                target_str.clone(),
                 size.clone(),
                 name.clone(),
             )) {
+                let labels = vec![
+                    ("component", component.clone()),
+                    ("operation", "read".into()),
+                    ("size", size.clone()),
+                    ("target", target_str.clone()),
+                ];
+
+                let write_labels = vec![
+                    ("component", component.clone()),
+                    ("operation", "write".into()),
+                    ("size", size),
+                    ("target", target_str.clone()),
+                ];
+
                 match name.as_str() {
                     "disk_iosize" => {
                         brw.disk_io_total.get_or_create(&labels).inc_by(b.read);
@@ -476,6 +480,24 @@ fn build_changelog_stats(x: &TargetStat<ChangelogStat>, brw: &BrwStatsMetrics) {
     }
 }
 
+/// Build labels for TargetStat variants with component+target.
+#[inline]
+fn target_labels(kind: &TargetVariant, target: &Target) -> Vec<(&'static str, String)> {
+    vec![
+        ("component", kind.to_prom_label().to_string()),
+        ("target", target.to_string()),
+    ]
+}
+
+/// Build labels for recovery-related variants using kind (string) + target.
+#[inline]
+fn recovery_labels(kind: &TargetVariant, target: &Target) -> Vec<(&'static str, String)> {
+    vec![
+        ("kind", kind.to_string()),
+        ("target", target.to_string()),
+    ]
+}
+
 pub fn build_target_stats(
     x: &TargetStats,
     metrics: &Metrics,
@@ -492,140 +514,98 @@ pub fn build_target_stats(
             metrics
                 .brw
                 .inodes_free
-                .get_or_create(&vec![
-                    ("component", x.kind.to_prom_label().to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&target_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::FilesTotal(x) => {
             metrics
                 .brw
                 .inodes_maximum
-                .get_or_create(&vec![
-                    ("component", x.kind.to_prom_label().to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&target_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::KBytesAvail(x) => {
             metrics
                 .brw
                 .available_kbytes
-                .get_or_create(&vec![
-                    ("component", x.kind.to_prom_label().to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&target_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::KBytesFree(x) => {
             metrics
                 .brw
                 .free_kbytes
-                .get_or_create(&vec![
-                    ("component", x.kind.to_prom_label().to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&target_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::KBytesTotal(x) => {
             metrics
                 .brw
                 .capacity_kbytes
-                .get_or_create(&vec![
-                    ("component", x.kind.to_prom_label().to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&target_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::NumExports(x) => {
             metrics
                 .brw
                 .exports_total
-                .get_or_create(&vec![
-                    ("component", x.kind.to_prom_label().to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&target_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::TotDirty(x) => {
             metrics
                 .brw
                 .exports_dirty_total
-                .get_or_create(&vec![
-                    ("component", x.kind.to_prom_label().to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&target_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::TotGranted(x) => {
             metrics
                 .brw
                 .exports_granted_total
-                .get_or_create(&vec![
-                    ("component", x.kind.to_prom_label().to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&target_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::TotPending(x) => {
             metrics
                 .brw
                 .exports_pending_total
-                .get_or_create(&vec![
-                    ("component", x.kind.to_prom_label().to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&target_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::ContendedLocks(x) => {
             metrics
                 .brw
                 .lock_contended_total
-                .get_or_create(&vec![
-                    ("component", x.kind.to_prom_label().to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&target_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::ContentionSeconds(x) => {
             metrics
                 .brw
                 .lock_contention_seconds_total
-                .get_or_create(&vec![
-                    ("component", x.kind.to_prom_label().to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&target_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::ConnectedClients(x) => {
             metrics
                 .brw
                 .connected_clients
-                .get_or_create(&vec![
-                    ("component", x.kind.to_prom_label().to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&target_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::LockCount(x) => {
             metrics
                 .brw
                 .lock_count_total
-                .get_or_create(&vec![
-                    ("component", x.kind.to_prom_label().to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&target_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::LockTimeouts(x) => {
             metrics
                 .brw
                 .lock_timeout_total
-                .get_or_create(&vec![
-                    ("component", x.kind.to_prom_label().to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&target_labels(&x.kind, &x.target))
                 .inc_by(x.value);
         }
         TargetStats::Llite(x) => build_llite_stats(x, &metrics.llite),
@@ -633,70 +613,49 @@ pub fn build_target_stats(
             metrics
                 .brw
                 .recovery_status
-                .get_or_create(&vec![
-                    ("kind", x.kind.to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&recovery_labels(&x.kind, &x.target))
                 .set(x.value as u64);
         }
         TargetStats::RecoveryCompletedClients(x) => {
             metrics
                 .brw
                 .recovery_status_completed_clients
-                .get_or_create(&vec![
-                    ("kind", x.kind.to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&recovery_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::RecoveryConnectedClients(x) => {
             metrics
                 .brw
                 .recovery_status_connected_clients
-                .get_or_create(&vec![
-                    ("kind", x.kind.to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&recovery_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::RecoveryEvictedClients(x) => {
             metrics
                 .brw
                 .recovery_status_evicted_clients
-                .get_or_create(&vec![
-                    ("kind", x.kind.to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&recovery_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::RecoveryDuration(x) => {
             metrics
                 .brw
                 .recovery_status_duration_seconds
-                .get_or_create(&vec![
-                    ("kind", x.kind.to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&recovery_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::RecoveryTimeRemaining(x) => {
             metrics
                 .brw
                 .recovery_status_time_remaining_seconds
-                .get_or_create(&vec![
-                    ("kind", x.kind.to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&recovery_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::RecoveryTotalClients(x) => {
             metrics
                 .brw
                 .recovery_status_total_clients
-                .get_or_create(&vec![
-                    ("kind", x.kind.to_string()),
-                    ("target", x.target.to_string()),
-                ])
+                .get_or_create(&recovery_labels(&x.kind, &x.target))
                 .set(x.value);
         }
         TargetStats::ExportStats(x) => {

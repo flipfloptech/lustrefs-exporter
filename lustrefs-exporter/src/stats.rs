@@ -253,15 +253,16 @@ impl StatsMetrics {
 }
 
 pub fn build_ost_stats(stats: &[Stat], target: &Target, metrics: &StatsMetrics) {
-    let kind = TargetVariant::Ost;
+    let component = TargetVariant::Ost.to_prom_label().to_string();
+    let target_str = target.deref().to_string();
 
     for s in stats {
         match s.name.as_str() {
             "read_bytes" => {
                 let read_labels = vec![
-                    ("component", kind.to_prom_label().to_string()),
+                    ("component", component.clone()),
                     ("operation", "read".into()),
-                    ("target", target.deref().to_string()),
+                    ("target", target_str.clone()),
                 ];
 
                 metrics
@@ -292,9 +293,9 @@ pub fn build_ost_stats(stats: &[Stat], target: &Target, metrics: &StatsMetrics) 
             }
             "write_bytes" => {
                 let write_labels = vec![
-                    ("component", kind.to_prom_label().to_string()),
+                    ("component", component.clone()),
                     ("operation", "write".into()),
-                    ("target", target.deref().to_string()),
+                    ("target", target_str.clone()),
                 ];
 
                 metrics
@@ -324,64 +325,64 @@ pub fn build_ost_stats(stats: &[Stat], target: &Target, metrics: &StatsMetrics) 
                 }
             }
             "get_page" => {
-                let get_page_labels = vec![
-                    ("component", kind.to_prom_label().to_string()),
+                let labels = vec![
+                    ("component", component.clone()),
                     ("operation", "get_page".into()),
-                    ("target", target.deref().to_string()),
+                    ("target", target_str.clone()),
                 ];
 
                 metrics
                     .get_page_total
-                    .get_or_create(&get_page_labels)
+                    .get_or_create(&labels)
                     .inc_by(s.samples);
             }
 
             "cache_access" => {
-                let cache_access_labels = vec![
-                    ("component", kind.to_prom_label().to_string()),
+                let labels = vec![
+                    ("component", component.clone()),
                     ("operation", "cache_access".into()),
-                    ("target", target.deref().to_string()),
+                    ("target", target_str.clone()),
                 ];
 
                 metrics
                     .cache_access_total
-                    .get_or_create(&cache_access_labels)
+                    .get_or_create(&labels)
                     .inc_by(s.samples);
             }
             "cache_hit" => {
-                let cache_hit_labels = vec![
-                    ("component", kind.to_prom_label().to_string()),
+                let labels = vec![
+                    ("component", component.clone()),
                     ("operation", "cache_hit".into()),
-                    ("target", target.deref().to_string()),
+                    ("target", target_str.clone()),
                 ];
 
                 metrics
                     .cache_hit_total
-                    .get_or_create(&cache_hit_labels)
+                    .get_or_create(&labels)
                     .inc_by(s.samples);
             }
             "cache_miss" => {
-                let cache_miss_labels = vec![
-                    ("component", kind.to_prom_label().to_string()),
+                let labels = vec![
+                    ("component", component.clone()),
                     ("operation", "cache_miss".into()),
-                    ("target", target.deref().to_string()),
+                    ("target", target_str.clone()),
                 ];
 
                 metrics
                     .cache_miss_total
-                    .get_or_create(&cache_miss_labels)
+                    .get_or_create(&labels)
                     .inc_by(s.samples);
             }
             "many_credits" => {
-                let many_credits_labels = vec![
-                    ("component", kind.to_prom_label().to_string()),
+                let labels = vec![
+                    ("component", component.clone()),
                     ("operation", "many_credits".into()),
-                    ("target", target.deref().to_string()),
+                    ("target", target_str.clone()),
                 ];
 
                 metrics
                     .many_credits_total
-                    .get_or_create(&many_credits_labels)
+                    .get_or_create(&labels)
                     .inc_by(s.samples);
             }
             _ => {
@@ -392,13 +393,14 @@ pub fn build_ost_stats(stats: &[Stat], target: &Target, metrics: &StatsMetrics) 
 }
 
 pub fn build_mdt_stats(stats: &[Stat], target: &Target, metrics: &StatsMetrics) {
-    let kind = TargetVariant::Mdt;
+    let component = TargetVariant::Mdt.to_prom_label().to_string();
+    let target_str = target.deref().to_string();
 
     for s in stats {
         let labels = vec![
-            ("component", kind.to_prom_label().to_string()),
+            ("component", component.clone()),
             ("operation", s.name.deref().to_string()),
-            ("target", target.deref().to_string()),
+            ("target", target_str.clone()),
         ];
 
         metrics.stats_total.get_or_create(&labels).inc_by(s.samples);
@@ -497,14 +499,19 @@ pub fn build_export_stats(x: &TargetStat<Vec<ExportStats>>, metrics: &StatsMetri
         return;
     }
 
+    let component = kind.to_prom_label().to_string();
+    let target_str = target.deref().to_string();
+
     for e in export_stats {
         let ExportStats { nid, stats } = e;
+        let nid_str = nid.as_str().to_string();
+
         for s in stats {
             let labels = vec![
-                ("component", kind.to_prom_label().to_string()),
+                ("component", component.clone()),
                 ("name", s.name.as_str().to_string()),
-                ("nid", nid.as_str().to_string()),
-                ("target", target.deref().to_string()),
+                ("nid", nid_str.clone()),
+                ("target", target_str.clone()),
                 ("units", s.units.as_str().to_string()),
             ];
 
