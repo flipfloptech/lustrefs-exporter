@@ -1,0 +1,43 @@
+version: "3"
+
+vars:
+  BINARY_NAME: lustrefs-exporter
+  OUTPUT_DIR: dist
+
+tasks:
+  rocky8.10:
+    desc: Build lustrefs-exporter for Rocky Linux 8.10
+    cmds:
+      - task: build
+        vars:
+          BASE_IMAGE: rockylinux:8.10
+          TAG: rocky8.10
+
+  rocky9.5:
+    desc: Build lustrefs-exporter for Rocky Linux 9.5
+    cmds:
+      - task: build
+        vars:
+          BASE_IMAGE: rockylinux:9.5
+          TAG: rocky9.5
+
+  build:
+    desc: "Build lustrefs-exporter for a given BASE_IMAGE (internal)"
+    internal: true
+    requires:
+      vars: [BASE_IMAGE, TAG]
+    vars:
+      IMAGE_NAME: "{{.BINARY_NAME}}:{{.TAG}}"
+      CONTAINER_NAME: "{{.BINARY_NAME}}-extract-{{.TAG}}"
+    cmds:
+      - echo "Building {{.BINARY_NAME}} for {{.BASE_IMAGE}}..."
+      - >-
+        podman build
+        --build-arg BASE_IMAGE={{.BASE_IMAGE}}
+        -t {{.IMAGE_NAME}}
+        .
+      - mkdir -p {{.OUTPUT_DIR}}
+      - podman create --name {{.CONTAINER_NAME}} {{.IMAGE_NAME}}
+      - podman cp {{.CONTAINER_NAME}}:/usr/local/bin/{{.BINARY_NAME}} {{.OUTPUT_DIR}}/{{.BINARY_NAME}}-{{.TAG}}
+      - podman rm {{.CONTAINER_NAME}}
+      - echo "Binary written to {{.OUTPUT_DIR}}/{{.BINARY_NAME}}-{{.TAG}}"
