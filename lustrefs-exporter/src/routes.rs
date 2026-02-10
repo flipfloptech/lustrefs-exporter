@@ -40,7 +40,7 @@ pub struct Params {
 }
 
 const TIMEOUT_DURATION_SECS: u64 = 120;
-const DEFAULT_CACHE_TTL_SECS: u64 = 5;
+const DEFAULT_CACHE_TTL_SECS: u64 = 1;
 const DEFAULT_SUBPROCESS_TIMEOUT_SECS: u64 = 30;
 
 /// Cached scrape response to avoid running duplicate subprocesses.

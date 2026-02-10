@@ -16,7 +16,9 @@ pub struct CommandOpts {
 
     /// Response cache TTL in seconds. Concurrent scrapes within this window
     /// are served from cache, preventing duplicate subprocess invocations.
-    #[clap(long, env = "LUSTREFS_EXPORTER_CACHE_TTL", default_value = "5")]
+    /// The write-lock coalescing ensures only one scrape runs at a time
+    /// regardless of TTL; this value controls post-scrape staleness tolerance.
+    #[clap(long, env = "LUSTREFS_EXPORTER_CACHE_TTL", default_value = "1")]
     pub cache_ttl_secs: u64,
 
     /// Timeout in seconds for each subprocess (lctl, lnetctl). If a subprocess

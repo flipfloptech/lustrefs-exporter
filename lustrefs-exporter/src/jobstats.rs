@@ -241,14 +241,16 @@ fn render_stat(
         TargetVariant::Mdt
     };
 
-    let job = job.replace("- job_id:", "").replace('"', "");
-    let jobid = job.trim();
+    // Trim "- job_id:" prefix and quotes without intermediate String allocations.
+    let jobid = job
+        .trim_start_matches("- job_id:")
+        .trim()
+        .trim_matches('"');
 
-    let base_labels = vec![
-        ("component", kind.to_prom_label().to_string()),
-        ("jobid", jobid.to_string()),
-        ("target", target.to_string()),
-    ];
+    // Pre-compute label strings once per job (reused across all stat lines).
+    let component = kind.to_prom_label().to_string();
+    let jobid_str = jobid.to_string();
+    let target_str = target.to_string();
 
     for stat in stats {
         let cap = JOB_STAT
@@ -262,8 +264,13 @@ fn render_stat(
         let sum = sum.parse();
         let samples = samples.parse();
 
-        let mut labels = base_labels.clone();
-        labels.insert(2, ("operation", stat_name.to_string()));
+        // Build labels in sorted order directly — no clone + insert shift.
+        let labels = vec![
+            ("component", component.clone()),
+            ("jobid", jobid_str.clone()),
+            ("operation", stat_name.to_string()),
+            ("target", target_str.clone()),
+        ];
 
         if kind == TargetVariant::Ost {
             match stat_name {
