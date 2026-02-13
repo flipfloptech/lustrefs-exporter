@@ -2,11 +2,10 @@
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
-use const_format::{formatcp, str_repeat};
 use criterion::{Criterion, criterion_group, criterion_main};
 use lustrefs_exporter::jobstats::JobstatMetrics;
 use prometheus_client::{encoding::text::encode, registry::Registry};
-use std::{hint, io::BufReader};
+use std::{hint, io::BufReader, sync::LazyLock};
 
 const JOBSTAT_JOB: &str = r#"
 - job_id:          "FAKE_JOB"
@@ -27,19 +26,20 @@ const JOBSTAT_JOB: &str = r#"
   quotactl:        { samples:           0, unit: usecs, min:        0, max:        0, sum:                0, sumsq:                  0 }
   prealloc:        { samples:           0, unit: usecs, min:        0, max:        0, sum:                0, sumsq:                  0 }"#;
 
-#[allow(long_running_const_eval)]
-const INPUT_100_JOBS: &str = formatcp!(
-    r#"obdfilter.ds002-OST0000.job_stats=
-job_stats:{}"#,
-    str_repeat!(JOBSTAT_JOB, 100)
-);
+/// Build a synthetic jobstats input at runtime and leak it for a `'static`
+/// lifetime. This avoids the `const_format::str_repeat!` compile-time penalty
+/// that stalls the const evaluator for minutes on large inputs.
+fn make_input(n: usize) -> &'static str {
+    let s = format!(
+        "obdfilter.ds002-OST0000.job_stats=\njob_stats:{}",
+        JOBSTAT_JOB.repeat(n)
+    );
+    // Leak is fine — benchmarks are short-lived processes.
+    Box::leak(s.into_boxed_str())
+}
 
-#[allow(long_running_const_eval)]
-const INPUT_1000_JOBS: &str = formatcp!(
-    r#"obdfilter.ds002-OST0000.job_stats=
-job_stats:{}"#,
-    str_repeat!(JOBSTAT_JOB, 1000)
-);
+static INPUT_100_JOBS: LazyLock<&'static str> = LazyLock::new(|| make_input(100));
+static INPUT_1000_JOBS: LazyLock<&'static str> = LazyLock::new(|| make_input(1000));
 
 async fn parse_synthetic_yaml(input: &'static str) -> String {
     // Setup jobstats metrics
@@ -66,7 +66,7 @@ fn criterion_benchmark_fast(c: &mut Criterion) {
                 .build()
                 .expect("Failed to build tokio runtime"),
         )
-        .iter(|| hint::black_box(parse_synthetic_yaml(INPUT_100_JOBS)))
+        .iter(|| hint::black_box(parse_synthetic_yaml(*INPUT_100_JOBS)))
     });
 
     c.bench_function("jobstats 1000", |b| {
@@ -75,7 +75,7 @@ fn criterion_benchmark_fast(c: &mut Criterion) {
                 .build()
                 .expect("Failed to build tokio runtime"),
         )
-        .iter(|| hint::black_box(parse_synthetic_yaml(INPUT_1000_JOBS)))
+        .iter(|| hint::black_box(parse_synthetic_yaml(*INPUT_1000_JOBS)))
     });
 }
 criterion_group! {

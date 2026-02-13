@@ -7,15 +7,10 @@ version.workspace = true
 [dependencies]
 async-stream = "0.3.6"
 axum = { workspace = true, features = ["http2"] }
+bytes = "1"
 clap = { workspace = true, features = ["derive", "env", "wrap_help", "string"] }
-futures-core = "0.3.31"
 lustre_collector.path = "../lustre-collector"
 prometheus-client.workspace = true
-regex = { version = "1", default-features = false, features = [
-  "perf",
-  "std",
-  "perf-dfa-full",
-] }
 serde = { version = "1", features = ["derive"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = [
@@ -31,7 +26,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [dev-dependencies]
 combine.workspace = true
 commandeer-test.workspace = true
-const_format.workspace = true
 criterion = { workspace = true, features = ["html_reports", "async_tokio"] }
 iai-callgrind.workspace = true
 insta = { workspace = true, features = ["glob"] }

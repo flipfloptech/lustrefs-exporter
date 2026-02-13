@@ -20,6 +20,11 @@ pub struct CommandOpts {
     #[clap(long, env = "LUSTREFS_EXPORTER_SUBPROCESS_TIMEOUT", default_value = "30")]
     pub subprocess_timeout_secs: u64,
 
+    /// Cache TTL in seconds. Concurrent requests within this window share
+    /// a single scrape result instead of spawning new subprocesses.
+    #[clap(long, env = "LUSTREFS_EXPORTER_CACHE_TTL", default_value = "1")]
+    pub cache_ttl_secs: u64,
+
     /// Dump stats as raw string and exit
     #[clap(long, hide = true)]
     dump: bool,
@@ -40,6 +45,7 @@ async fn main() -> Result<(), Error> {
 
         let config = AppConfig {
             subprocess_timeout: Duration::from_secs(opts.subprocess_timeout_secs),
+            cache_ttl: Duration::from_secs(opts.cache_ttl_secs),
         };
 
         let listener = tokio::net::TcpListener::bind(("0.0.0.0", opts.port)).await?;

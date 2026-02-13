@@ -342,7 +342,10 @@ pub mod tests {
             let otel_metrics = read_metrics_from_snapshot(path);
             let metrics = read_metrics_from_snapshot(&snap_file);
 
-            compare_metrics(&otel_metrics, &metrics);
+            // Only check that otel ⊆ current (no regressions from migration).
+            // Current may have extra metrics from newly handled operations
+            // (e.g. read, write, prealloc) — those are additions, not regressions.
+            compare_metrics_superset(&otel_metrics, &metrics);
         });
 
         Ok(())
@@ -404,6 +407,39 @@ pub mod tests {
             normalized_docs1,
             normalized_docs2,
             "Metrics help are not the same"
+        );
+    }
+
+    /// Like `compare_metrics`, but only asserts that all metrics in `baseline`
+    /// exist in `current`. Extra metrics in `current` are allowed — they
+    /// represent newly handled operations (e.g. read, write, prealloc).
+    fn compare_metrics_superset(baseline: &Scrape, current: &Scrape) {
+        let baseline_set: HashSet<_> = baseline
+            .samples
+            .iter()
+            .filter(|s| !IGNORED_METRICS.contains(&s.metric.as_str()))
+            .map(normalize_sample)
+            .collect();
+
+        let current_set: HashSet<_> = current
+            .samples
+            .iter()
+            .filter(|s| !IGNORED_METRICS.contains(&s.metric.as_str()))
+            .map(normalize_sample)
+            .collect();
+
+        let missing: Vec<_> = baseline_set.difference(&current_set).collect();
+
+        if !missing.is_empty() {
+            println!("Metrics in baseline but missing from current:");
+            for metric in &missing {
+                println!("{metric:?}");
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "Regression: baseline metrics missing from current implementation"
         );
     }
 
