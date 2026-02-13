@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, mpsc};
 
 #[derive(Debug, Parser)]
 #[command(name = "lustrefs-loadtest")]
-#[command(about = "HTTP load-testing and fixture generation tool for lustrefs-exporter")]
+#[command(about = "HTTP load-testing tool for lustrefs-exporter")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -77,24 +77,6 @@ enum Commands {
         /// Request timeout in seconds
         #[arg(long = "timeout", default_value_t = 120)]
         timeout: u64,
-    },
-    /// Generate a massive synthetic Lustre procfs fixture for stress-testing
-    Fixture {
-        /// Directory where the fixture tree will be created
-        #[arg(short = 'o', long = "output-dir")]
-        output_dir: std::path::PathBuf,
-
-        /// Number of jobs per target
-        #[arg(short = 'j', long = "jobs", default_value_t = 1000)]
-        num_jobs: usize,
-
-        /// Number of OST targets
-        #[arg(long = "osts", default_value_t = 2)]
-        num_osts: usize,
-
-        /// Number of MDT targets
-        #[arg(long = "mdts", default_value_t = 1)]
-        num_mdts: usize,
     },
 }
 
@@ -515,63 +497,6 @@ async fn run_soak(
     println!();
 }
 
-// ---------------------------------------------------------------------------
-// Fixture generation
-// ---------------------------------------------------------------------------
-
-fn generate_fixture(
-    output_dir: &std::path::Path,
-    num_jobs: usize,
-    num_osts: usize,
-    num_mdts: usize,
-) -> Result<()> {
-    use std::fs;
-    use std::io::Write;
-
-    println!("Generating fixture in {}...", output_dir.display());
-
-    // Create OST fixtures
-    for i in 0..num_osts {
-        let ost_name = format!("ds{:03}-OST{:04}", i / 100, i % 100);
-        let ost_dir = output_dir.join(format!("osd-ldiskfs/{}", ost_name));
-        fs::create_dir_all(&ost_dir)?;
-
-        let mut f = fs::File::create(ost_dir.join("job_stats"))?;
-        writeln!(f, "obdfilter.{}.job_stats=", ost_name)?;
-        writeln!(f, "job_stats:")?;
-
-        for j in 0..num_jobs {
-            let job_id = format!("job_{}", j);
-            writeln!(f, "- job_id:          \"{}\"", job_id)?;
-            writeln!(f, "  snapshot_time:   1720516680")?;
-            writeln!(f, "  read_bytes:      {{ samples:          100, unit: bytes, min:     4096, max:   475136, sum:          5468160, sumsq:      1071040692224 }}")?;
-            writeln!(f, "  write_bytes:     {{ samples:          100, unit: bytes, min:     4096, max:   475136, sum:          5468160, sumsq:      1071040692224 }}")?;
-            writeln!(f, "  getattr:         {{ samples:           10, unit: usecs, min:       10, max:      100, sum:             1000, sumsq:            100000 }}")?;
-        }
-    }
-
-    // Create MDT fixtures
-    for i in 0..num_mdts {
-        let mdt_name = format!("ds{:03}-MDT{:04}", i / 100, i % 100);
-        let mdt_dir = output_dir.join(format!("mdt/{}", mdt_name));
-        fs::create_dir_all(&mdt_dir)?;
-
-        let mut f = fs::File::create(mdt_dir.join("job_stats"))?;
-        writeln!(f, "mdt.{}.job_stats=", mdt_name)?;
-        writeln!(f, "job_stats:")?;
-
-        for j in 0..num_jobs {
-            let job_id = format!("job_{}", j);
-            writeln!(f, "- job_id:          \"{}\"", job_id)?;
-            writeln!(f, "  snapshot_time:   1720516680")?;
-            writeln!(f, "  open:            {{ samples:          100, unit: usecs, min:       10, max:      100, sum:             1000, sumsq:            100000 }}")?;
-            writeln!(f, "  close:           {{ samples:          100, unit: usecs, min:       10, max:      100, sum:             1000, sumsq:            100000 }}")?;
-        }
-    }
-
-    println!("Fixture generation complete.");
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Statistics & Reporting (for `run` subcommand)
@@ -728,14 +653,7 @@ async fn main() -> Result<()> {
 
             run_soak(&url, threads, duration, max_jitter, insecure, timeout).await;
         }
-        Commands::Fixture {
-            output_dir,
-            num_jobs,
-            num_osts,
-            num_mdts,
-        } => {
-            generate_fixture(&output_dir, num_jobs, num_osts, num_mdts)?;
-        }
+
     }
 
     Ok(())
