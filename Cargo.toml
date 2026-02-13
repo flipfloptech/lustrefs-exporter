@@ -1,5 +1,5 @@
 [workspace]
-members = ['lustre-collector', 'lustrefs-exporter']
+members = ['lustre-collector', 'lustrefs-exporter', 'lustrefs-loadtest']
 resolver = "3"
 
 [workspace.package]
@@ -17,6 +17,7 @@ cast_possible_wrap = "warn"
 unwrap_used = "warn"
 
 [workspace.dependencies]
+anyhow = "1"
 axum = "0.8"
 clap = "4"
 combine = "=4.6.7"
@@ -29,6 +30,7 @@ insta = "1"
 pretty_assertions = "1.4.1"
 prometheus-client = { git = "https://github.com/whamcloud/client_rust", branch = "whamcloud-08-12-2025" }
 prometheus-parse = "0.2.5"
+rand = "0.8"
 reqwest = "0.11"
 serde = "1"
 serde_json = "1"

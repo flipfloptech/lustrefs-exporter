@@ -11,8 +11,7 @@ bytes = "1"
 clap = { workspace = true, features = ["derive", "env", "wrap_help", "string"] }
 lustre_collector.path = "../lustre-collector"
 prometheus-client.workspace = true
-rand = "0.8"
-reqwest.workspace = true
+
 serde = { version = "1", features = ["derive"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = [
@@ -33,7 +32,7 @@ iai-callgrind.workspace = true
 insta = { workspace = true, features = ["glob"] }
 pretty_assertions.workspace = true
 prometheus-parse.workspace = true
-
+reqwest.workspace = true
 serde_json.workspace = true
 serial_test.workspace = true
 sysinfo.workspace = true
@@ -46,10 +45,6 @@ bench = false
 name = "lustrefs-exporter"
 path = "src/main.rs"
 
-[[bin]]
-bench = false
-name = "soak-test"
-path = "src/bin/soak_test.rs"
 
 [[bench]]
 harness = false
