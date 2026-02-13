@@ -36,9 +36,9 @@ RUN mkdir -p lustre-collector/src lustrefs-exporter/src lustrefs-loadtest/src \
     && cargo build --release -p lustrefs-exporter 2>/dev/null || true \
     && rm -rf lustre-collector/src lustrefs-exporter/src lustrefs-loadtest/src
 
-# Copy real source and build
+# Copy real source and build both binaries
 COPY . .
-RUN cargo build --release -p lustrefs-exporter
+RUN cargo build --release -p lustrefs-exporter -p lustrefs-loadtest
 
 # ── Runtime stage ────────────────────────────────────────────────────────
 FROM ${BASE_IMAGE}
@@ -50,6 +50,7 @@ RUN dnf install -y \
     && dnf clean all
 
 COPY --from=builder /build/target/release/lustrefs-exporter /usr/local/bin/lustrefs-exporter
+COPY --from=builder /build/target/release/lustrefs-loadtest /usr/local/bin/lustrefs-loadtest
 
 EXPOSE 32221
 

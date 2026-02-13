@@ -38,6 +38,7 @@ tasks:
         .
       - mkdir -p {{.OUTPUT_DIR}}
       - podman create --replace --name {{.CONTAINER_NAME}} {{.IMAGE_NAME}}
-      - podman cp {{.CONTAINER_NAME}}:/usr/local/bin/{{.BINARY_NAME}} {{.OUTPUT_DIR}}/{{.BINARY_NAME}}-{{.TAG}}
+      - podman cp {{.CONTAINER_NAME}}:/usr/local/bin/lustrefs-exporter {{.OUTPUT_DIR}}/lustrefs-exporter-{{.TAG}}
+      - podman cp {{.CONTAINER_NAME}}:/usr/local/bin/lustrefs-loadtest {{.OUTPUT_DIR}}/lustrefs-loadtest-{{.TAG}}
       - podman rm {{.CONTAINER_NAME}}
-      - echo "Binary written to {{.OUTPUT_DIR}}/{{.BINARY_NAME}}-{{.TAG}}"
+      - echo "Binaries written to {{.OUTPUT_DIR}}/"
