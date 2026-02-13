@@ -25,14 +25,16 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY lustre-collector/Cargo.toml lustre-collector/Cargo.toml
 COPY lustrefs-exporter/Cargo.toml lustrefs-exporter/Cargo.toml
+COPY lustrefs-loadtest/Cargo.toml lustrefs-loadtest/Cargo.toml
 
 # Create stub lib/main files so cargo can resolve the workspace
-RUN mkdir -p lustre-collector/src lustrefs-exporter/src \
+RUN mkdir -p lustre-collector/src lustrefs-exporter/src lustrefs-loadtest/src \
     && echo 'pub fn stub() {}' > lustre-collector/src/lib.rs \
     && echo 'fn main() {}' > lustrefs-exporter/src/main.rs \
     && echo 'pub fn stub() {}' > lustrefs-exporter/src/lib.rs \
+    && echo 'fn main() {}' > lustrefs-loadtest/src/main.rs \
     && cargo build --release -p lustrefs-exporter 2>/dev/null || true \
-    && rm -rf lustre-collector/src lustrefs-exporter/src
+    && rm -rf lustre-collector/src lustrefs-exporter/src lustrefs-loadtest/src
 
 # Copy real source and build
 COPY . .
