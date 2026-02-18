@@ -6,7 +6,9 @@ use crate::{
     Error,
     jobstats::{JobstatMetrics, jobstats_stream},
     metrics::{self, Metrics},
+    subprocess_pool::{SubprocessPool, ExporterStats},
 };
+use std::sync::atomic::Ordering;
 use axum::{
     BoxError, Router,
     body::Body,
@@ -24,7 +26,7 @@ use std::{
     borrow::Cow,
     io,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{process::Command, sync::Mutex};
 use tower::{
@@ -60,69 +62,88 @@ impl Default for AppConfig {
     }
 }
 
-/// Cached scrape result using `Arc<str>` for zero-copy sharing across requests.
-type CachedResult = (Arc<str>, Option<Arc<str>>);
-
-/// Request coalescing + TTL caching for scrape results.
-///
-/// When multiple requests arrive concurrently:
-/// 1. If a cached result exists within TTL → serve immediately (Arc clone = refcount bump)
-/// 2. If a scrape is in-progress → subscribe to broadcast, wait for result
-/// 3. Otherwise → start a fresh scrape, broadcast result to all waiters
-struct ScrapeCache {
-    /// Most recent scrape: (timestamp, core_metrics, optional_jobstats)
-    last_scrape: Option<(Instant, Arc<str>, Option<Arc<str>>)>,
-    /// Active scrape broadcaster — waiters subscribe here
-    waiters: Option<tokio::sync::broadcast::Sender<CachedResult>>,
+/// The current state of an in-progress or cached scrape.
+#[derive(Debug, Clone)]
+pub enum ScrapeState {
+    /// Scrape just started, no data yet.
+    Started,
+    /// Core metrics (lctl core + lnetctl) are ready.
+    CoreReady(Arc<str>),
+    /// Full scrape (including jobstats) is complete.
+    Complete {
+        core: Arc<str>,
+        jobstats: Option<Arc<str>>,
+    },
+    /// Scrape failed.
+    Failed,
 }
 
-/// Shared application state holding persistent metrics, registry, and scrape cache.
+/// A snapshot of the scrape progress.
+#[derive(Debug, Clone)]
+pub struct ScrapeSnapshot {
+    pub state: ScrapeState,
+}
+
+/// Type used for coalescing concurrent requests.
+
+/// FIFO backpressure coordinator.
 ///
-/// `Family::clone()` shares the backing `Arc<RwLock<BTreeMap>>`, so the
-/// `Registry` and `Metrics`/`JobstatMetrics` reference the same live data.
-/// On each scrape we `clear()` all families, re-populate from fresh data,
-/// and encode from the persistent `Registry`. Empty families are skipped
-/// by the encoder, so jobstat descriptors only appear when populated.
+/// When all pool workers are busy, incoming requests coalesce onto the
+/// **most recently started** scrape via its watch channel.
+struct ScrapeCoordinator {
+    /// The latest active or recently completed scrape.
+    latest_watch: Option<tokio::sync::watch::Receiver<ScrapeSnapshot>>,
+}
+
+/// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
+    /// Persistent REPL subprocess pool. `None` in test mode (falls back to
+    /// per-request subprocess spawning).
+    pool: Option<Arc<SubprocessPool>>,
+    /// Per-request fallback: shared metrics/registry for subprocess mode.
     core_registry: Arc<Registry>,
     jobstats_registry: Arc<Registry>,
     metrics: Arc<Metrics>,
     jobstat_metrics: Arc<JobstatMetrics>,
-    scrape_cache: Arc<Mutex<ScrapeCache>>,
+    /// Backpressure coordinator for pool mode.
+    coordinator: Arc<Mutex<ScrapeCoordinator>>,
+    /// Exporter stats (shared between pool and legacy mode).
+    pool_stats: Arc<ExporterStats>,
     config: AppConfig,
 }
 
+/// Create an app without a pool (subprocess-per-request, used by tests).
 pub fn app() -> Router {
     app_with_config(AppConfig::default())
 }
 
+/// Create an app without a pool (subprocess-per-request mode).
 pub fn app_with_config(config: AppConfig) -> Router {
     let mut core_registry = Registry::default();
     let mut jobstats_registry = Registry::default();
     let metrics = Metrics::default();
     let jobstat_metrics = JobstatMetrics::default();
 
-    // Register all metric families.
-    // Jobstats go to their own registry for streaming.
     jobstat_metrics.register_metric(&mut jobstats_registry);
     metrics.register_metric(&mut core_registry);
 
     tracing::info!(
         subprocess_timeout_secs = config.subprocess_timeout.as_secs(),
         cache_ttl_secs = config.cache_ttl.as_secs(),
-        "Exporter configuration"
+        "Exporter configuration (subprocess-per-request mode)"
     );
 
     let state = AppState {
+        pool: None,
         core_registry: Arc::new(core_registry),
         jobstats_registry: Arc::new(jobstats_registry),
         metrics: Arc::new(metrics),
         jobstat_metrics: Arc::new(jobstat_metrics),
-        scrape_cache: Arc::new(Mutex::new(ScrapeCache {
-            last_scrape: None,
-            waiters: None,
+        coordinator: Arc::new(Mutex::new(ScrapeCoordinator {
+            latest_watch: None,
         })),
+        pool_stats: Arc::new(ExporterStats::new()),
         config,
     };
 
@@ -138,6 +159,50 @@ pub fn app_with_config(config: AppConfig) -> Router {
     Router::new()
         .route("/metrics", get(scrape))
         .layer(load_shedder)
+        .with_state(state)
+}
+
+/// Create an app with a persistent REPL subprocess pool (production mode).
+///
+/// Pool workers self-regulate via try-acquire. Excess requests coalesce
+/// onto the most recently started scrape — no load shedding, no 503s.
+pub fn app_with_pool(pool: Arc<SubprocessPool>, config: AppConfig) -> Router {
+    // These are only used as fallback; pool mode creates per-scrape instances.
+    let core_registry = Registry::default();
+    let jobstats_registry = Registry::default();
+    let metrics = Metrics::default();
+    let jobstat_metrics = JobstatMetrics::default();
+
+    tracing::info!(
+        cache_ttl_secs = config.cache_ttl.as_secs(),
+        "Exporter configuration (REPL pool mode)"
+    );
+
+    let state = AppState {
+        pool: Some(pool.clone()),
+        core_registry: Arc::new(core_registry),
+        jobstats_registry: Arc::new(jobstats_registry),
+        metrics: Arc::new(metrics),
+        jobstat_metrics: Arc::new(jobstat_metrics),
+        coordinator: Arc::new(Mutex::new(ScrapeCoordinator {
+            latest_watch: None,
+        })),
+        pool_stats: Arc::clone(&pool.stats),
+        config,
+    };
+
+    // Pool mode: no load shedder or concurrency limit — the pool self-regulates.
+    // Keep compression and a generous timeout.
+    let middleware = ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(handle_error))
+        .layer(TimeoutLayer::new(std::time::Duration::from_secs(
+            TIMEOUT_DURATION_SECS,
+        )))
+        .layer(CompressionLayer::new());
+
+    Router::new()
+        .route("/metrics", get(scrape))
+        .layer(middleware)
         .with_state(state)
 }
 
@@ -196,43 +261,6 @@ pub fn lnet_stats_output() -> Command {
     cmd
 }
 
-/// Build a streaming HTTP response from cached `Arc<str>` buffers.
-///
-/// Uses `Bytes::from(Arc<str>)` for zero-copy response delivery — the
-/// `Arc` reference count is bumped, no data is copied.
-fn build_streaming_response(
-    core: Arc<str>,
-    jobstats: Option<Arc<str>>,
-    include_jobstats: bool,
-) -> Response {
-    let stream = async_stream::stream! {
-        if include_jobstats && jobstats.is_some() {
-            // Strip `# EOF\n` from core buffer so the combined stream
-            // has a single EOF at the end of jobstats.
-            let core_bytes = if core.ends_with("# EOF\n") {
-                Bytes::copy_from_slice(&core.as_bytes()[..core.len() - 6])
-            } else {
-                Bytes::copy_from_slice(core.as_bytes())
-            };
-            yield Ok::<Bytes, Error>(core_bytes);
-
-            if let Some(js) = jobstats {
-                yield Ok::<Bytes, Error>(Bytes::copy_from_slice(js.as_bytes()));
-            }
-        } else {
-            yield Ok::<Bytes, Error>(Bytes::copy_from_slice(core.as_bytes()));
-        }
-    };
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            CONTENT_TYPE,
-            "application/openmetrics-text; version=1.0.0; charset=utf-8",
-        )
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
 
 /// Perform a fresh scrape by running subprocesses and encoding metrics.
 ///
@@ -410,69 +438,356 @@ async fn perform_scrape(
     (core_arc, jobstats_buffer)
 }
 
-/// Main metrics scraping endpoint handler for the Prometheus exporter.
+// ---------------------------------------------------------------------------
+// Pooled scrape — uses persistent REPL workers, streams core before jobstats
+// ---------------------------------------------------------------------------
+
+/// Stream a scrape from a watch receiver.
 ///
-/// Implements request coalescing with TTL-based caching:
-/// 1. **Cache hit** — result within TTL served immediately (Arc refcount bump)
-/// 2. **In-progress scrape** — subscribe to broadcast, wait for shared result
-/// 3. **Fresh scrape** — run subprocesses, broadcast result to all waiters
+/// This handles both primary and coalesced requests by following the
+/// `ScrapeState` machine:
+/// 1. Wait for `CoreReady` -> Yield core metrics immediately.
+/// 2. Wait for `Complete` -> Yield jobstats (if requested).
+fn build_streaming_response_from_watch(
+    mut rx: tokio::sync::watch::Receiver<ScrapeSnapshot>,
+    include_jobstats: bool,
+) -> Response {
+    let stream = async_stream::stream! {
+        // Phase 1: Wait for Core
+        let core_data;
+        loop {
+            let snap = rx.borrow().clone();
+            match snap.state {
+                ScrapeState::CoreReady(core) => {
+                    core_data = Some(core);
+                    break;
+                }
+                ScrapeState::Complete { core, .. } => {
+                    core_data = Some(core);
+                    break;
+                }
+                ScrapeState::Failed => {
+                    yield Err(Error::Other("Scrape failed during core phase".into()));
+                    return;
+                }
+                ScrapeState::Started => {
+                    if rx.changed().await.is_err() {
+                        yield Err(Error::Other("Scrape task died".into()));
+                        return;
+                    }
+                }
+            }
+        }
+
+        let core = core_data.unwrap();
+        let core_bytes = if include_jobstats && core.ends_with("# EOF\n") {
+            // Strip EOF if we're expecting jobstats to follow
+            Bytes::copy_from_slice(&core.as_bytes()[..core.len() - 6])
+        } else {
+            Bytes::copy_from_slice(core.as_bytes())
+        };
+        yield Ok::<Bytes, Error>(core_bytes);
+
+        if !include_jobstats {
+            return;
+        }
+
+        // Phase 2: Wait for Jobstats (if requested)
+        loop {
+            let snap = rx.borrow().clone();
+            match snap.state {
+                ScrapeState::Complete { jobstats, .. } => {
+                    if let Some(js) = jobstats {
+                        yield Ok::<Bytes, Error>(Bytes::copy_from_slice(js.as_bytes()));
+                    } else {
+                        // Success but no jobstats (or empty) - still need local EOF
+                        yield Ok::<Bytes, Error>(Bytes::from_static(b"# EOF\n"));
+                    }
+                    return;
+                }
+                ScrapeState::CoreReady(_) | ScrapeState::Started => {
+                    if rx.changed().await.is_err() {
+                        // Scrape died or was replaced
+                        yield Ok::<Bytes, Error>(Bytes::from_static(b"# EOF\n"));
+                        return;
+                    }
+                }
+                ScrapeState::Failed => {
+                    yield Ok::<Bytes, Error>(Bytes::from_static(b"# EOF\n"));
+                    return;
+                }
+            }
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            CONTENT_TYPE,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+
+/// Encode raw lctl/lnetctl output into core metrics (OpenMetrics text).
+fn encode_core(
+    core_output: io::Result<Vec<u8>>,
+    net_output: io::Result<Vec<u8>>,
+    stats_output: io::Result<Vec<u8>>,
+) -> Arc<str> {
+    let mut core_registry = Registry::default();
+    let core_metrics = Metrics::default();
+    core_metrics.register_metric(&mut core_registry);
+
+    let mut output = vec![];
+
+    match core_output {
+        Ok(data) => match parse_lctl_output(&data) {
+            Ok(records) => output.extend(records),
+            Err(e) => tracing::warn!("Failed to parse lctl core output: {e}"),
+        },
+        Err(e) => tracing::warn!("lctl core query failed: {e}"),
+    }
+
+    match net_output {
+        Ok(data) => match parse_lnetctl_output(&data) {
+            Ok(records) => output.extend(records),
+            Err(e) => tracing::warn!("Failed to parse lnetctl net show output: {e}"),
+        },
+        Err(e) => tracing::warn!("lnetctl net show query failed: {e}"),
+    }
+
+    match stats_output {
+        Ok(data) => match parse_lnetctl_stats(&data) {
+            Ok(records) => output.extend(records),
+            Err(e) => tracing::warn!("Failed to parse lnetctl stats show output: {e}"),
+        },
+        Err(e) => tracing::warn!("lnetctl stats show query failed: {e}"),
+    }
+
+    metrics::build_lustre_stats(&output, &core_metrics);
+
+    let mut core_buffer = String::new();
+    if let Err(e) = encode(&mut core_buffer, &core_registry) {
+        tracing::warn!("Failed to encode core metrics: {e}");
+    }
+
+    Arc::from(core_buffer.as_str())
+}
+
+/// Encode raw jobstats data into OpenMetrics text.
+async fn encode_jobstats_data(data: Vec<u8>) -> Option<Arc<str>> {
+    let mut jobstats_registry = Registry::default();
+    let jobstat_metrics = JobstatMetrics::default();
+    jobstat_metrics.register_metric(&mut jobstats_registry);
+
+    let cursor = std::io::Cursor::new(data);
+    let reader = std::io::BufReader::new(cursor);
+    let handle = jobstats_stream(reader, jobstat_metrics);
+    let _returned_metrics = handle.await.unwrap_or_default();
+
+    let mut js_buffer = String::new();
+    if let Err(e) = encode(&mut js_buffer, &jobstats_registry) {
+        tracing::warn!("Failed to encode jobstats: {e}");
+    }
+
+    if js_buffer.is_empty() {
+        None
+    } else {
+        Some(Arc::from(js_buffer.as_str()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scrape endpoint — pool mode with coalesce, or legacy subprocess mode
+// ---------------------------------------------------------------------------
+
+/// Main metrics scraping endpoint handler.
 ///
-/// Each subprocess is wrapped with `tokio::time::timeout` to kill hung
-/// `lctl`/`lnetctl` processes. On timeout or error, the scrape continues
-/// with partial data — Prometheus handles missing metrics gracefully.
+/// **Pool mode** (production): try to acquire workers for a fresh scrape.
+/// If all workers are busy, coalesce onto the most recently started scrape.
+///
+/// **Subprocess mode** (tests/fallback): single scrape with coalescing,
+/// spawning fresh `lctl`/`lnetctl` processes per request.
 pub async fn scrape(
     State(state): State<AppState>,
     params: Query<Params>,
 ) -> impl IntoResponse {
-    let mut cache_guard = state.scrape_cache.lock().await;
+    if let Some(ref pool) = state.pool {
+        // ── Pool mode ──────────────────────────────────────────────
+        scrape_pooled(&state, pool, params.jobstats).await
+    } else {
+        // ── Legacy subprocess mode (tests) ─────────────────────────
+        scrape_subprocess(&state, params.jobstats).await
+    }
+}
 
-    // 1. Check if we have a fresh cached result
-    if let Some((timestamp, core, jobstats)) = &cache_guard.last_scrape {
-        if timestamp.elapsed() < state.config.cache_ttl {
-            // Serve cached: jobstats-requesting clients need jobstats in cache
-            if !params.jobstats || jobstats.is_some() {
-                let core = Arc::clone(core);
-                let jobstats = jobstats.as_ref().map(Arc::clone);
-                drop(cache_guard);
-                return build_streaming_response(core, jobstats, params.jobstats);
+/// Pool-mode scrape: try-acquire workers or coalesce onto latest active scrape.
+///
+/// **Streaming Coalescing Architecture**:
+/// 1. If workers are available, start a new `watch`-based scrape.
+/// 2. If workers are busy, join the `latest_watch` from the coordinator.
+/// 3. Both paths use `build_streaming_response_from_watch` which ensures
+///    CORE metrics are streamed as soon as any worker pair produces them.
+async fn scrape_pooled(
+    state: &AppState,
+    pool: &SubprocessPool,
+    include_jobstats: bool,
+) -> Response {
+    // 1. Try to join an existing active scrape first
+    {
+        let coord = state.coordinator.lock().await;
+        if let Some(rx) = &coord.latest_watch {
+            let state_to_join = rx.borrow().state.clone();
+            match state_to_join {
+                ScrapeState::Started | ScrapeState::CoreReady(_) | ScrapeState::Complete { .. } => {
+                    let rx_clone = rx.clone();
+                    pool.stats.coalesced_requests.fetch_add(1, Ordering::Relaxed);
+                    drop(coord);
+                    return build_streaming_response_from_watch(rx_clone, include_jobstats);
+                }
+                ScrapeState::Failed => { /* Try to start a new one instead */ }
             }
         }
     }
 
-    // 2. If a scrape is already in progress, wait for it
-    if let Some(tx) = &cache_guard.waiters {
-        let mut rx = tx.subscribe();
-        drop(cache_guard);
-        match rx.recv().await {
-            Ok((core, jobstats)) => {
-                return build_streaming_response(core, jobstats, params.jobstats);
+    // 2. Try to acquire a worker pair for a new scrape
+    if let Some((mut lctl, mut lnetctl)) = pool.try_acquire_pair() {
+        let (tx, rx) = tokio::sync::watch::channel(ScrapeSnapshot {
+            state: ScrapeState::Started,
+        });
+
+        // Register this as the latest active scrape
+        {
+            let mut coord = state.coordinator.lock().await;
+            coord.latest_watch = Some(rx.clone());
+        }
+
+        pool.stats
+            .total_scrapes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let core_params = parser::params();
+        let lctl_core_cmd = format!("get_param {}", core_params.join(" "));
+
+        // Driver Task: Runs the scrape and updates the watch channel
+        tokio::spawn(async move {
+            // Phase 1: Core (lctl core + lnetctl)
+            let lctl_core_fut = lctl.query(&lctl_core_cmd);
+            let lnetctl_fut = async {
+                let net = lnetctl.query("net show -v 4").await;
+                let stats = lnetctl.query("stats show").await;
+                (net, stats)
+            };
+
+            let (core_result, (net_result, stats_result)) = tokio::join!(lctl_core_fut, lnetctl_fut);
+            drop(lnetctl); // Free lnetctl worker immediately
+
+            let core_arc = encode_core(core_result, net_result, stats_result);
+
+            if !include_jobstats {
+                // Done.
+                let _ = tx.send(ScrapeSnapshot {
+                    state: ScrapeState::Complete {
+                        core: core_arc,
+                        jobstats: None,
+                    },
+                });
+                return;
             }
-            Err(_) => {
-                return Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Body::from("Scrape failed"))
-                    .unwrap();
-            }
+
+            // Signal that Core is ready so all waiters can start streaming
+            let _ = tx.send(ScrapeSnapshot {
+                state: ScrapeState::CoreReady(Arc::clone(&core_arc)),
+            });
+
+            // Phase 2: Jobstats
+            let jobstats_result = lctl
+                .query("get_param obdfilter.*OST*.job_stats mdt.*.job_stats")
+                .await;
+            drop(lctl); // Free lctl worker
+
+            let jobstats_arc = match jobstats_result {
+                Ok(data) => encode_jobstats_data(data).await,
+                Err(e) => {
+                    tracing::warn!("lctl jobstats query failed: {e}");
+                    None
+                }
+            };
+
+            let _ = tx.send(ScrapeSnapshot {
+                state: ScrapeState::Complete {
+                    core: core_arc,
+                    jobstats: jobstats_arc,
+                },
+            });
+        });
+
+        return build_streaming_response_from_watch(rx, include_jobstats);
+    }
+
+    // 3. Fallback: All workers busy, but no active scrape found (rare race)
+    // Coalesce onto whatever is in the coordinator even if it's Finished.
+    let rx = {
+        let coord = state.coordinator.lock().await;
+        coord.latest_watch.clone()
+    };
+
+    if let Some(rx) = rx {
+        build_streaming_response_from_watch(rx, include_jobstats)
+    } else {
+        Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from("Service Unavailable: Workers busy and no active scrape"))
+            .unwrap()
+    }
+}
+
+/// Legacy subprocess-mode scrape with coalescing (used by tests).
+async fn scrape_subprocess(state: &AppState, include_jobstats: bool) -> Response {
+    // 1. Try to join an existing active scrape
+    {
+        let coord = state.coordinator.lock().await;
+        if let Some(rx) = &coord.latest_watch {
+            let rx_clone = rx.clone();
+            state.pool_stats.coalesced_requests.fetch_add(1, Ordering::Relaxed);
+            drop(coord);
+            return build_streaming_response_from_watch(rx_clone, include_jobstats);
         }
     }
 
-    // 3. Start a new scrape — register broadcast for waiters
-    let (tx, _) = tokio::sync::broadcast::channel::<CachedResult>(16);
-    cache_guard.waiters = Some(tx.clone());
-    drop(cache_guard);
+    // 2. Start a new scrape
+    let (tx, rx) = tokio::sync::watch::channel(ScrapeSnapshot {
+        state: ScrapeState::Started,
+    });
 
-    // Perform the actual scrape
-    let (core, jobstats) = perform_scrape(&state, params.jobstats).await;
-
-    // Update cache and notify waiters
-    let mut cache_guard = state.scrape_cache.lock().await;
-    cache_guard.last_scrape = Some((Instant::now(), Arc::clone(&core), jobstats.clone()));
-    if let Some(waiters) = cache_guard.waiters.take() {
-        let _ = waiters.send((Arc::clone(&core), jobstats.clone()));
+    {
+        let mut coord = state.coordinator.lock().await;
+        coord.latest_watch = Some(rx.clone());
     }
-    drop(cache_guard);
 
-    build_streaming_response(core, jobstats, params.jobstats)
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        let (core, jobstats) = perform_scrape(&state_clone, include_jobstats).await;
+        
+        // Signal completion
+        let _ = tx.send(ScrapeSnapshot {
+            state: ScrapeState::Complete {
+                core,
+                jobstats,
+            },
+        });
+
+        // Clear coordinator
+        {
+            let mut coord = state_clone.coordinator.lock().await;
+            coord.latest_watch = None;
+        }
+    });
+
+    build_streaming_response_from_watch(rx, include_jobstats)
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ pub mod quota;
 pub mod routes;
 pub mod service;
 pub mod stats;
+pub mod subprocess_pool;
 
 use crate::routes::{
     jobstats_metrics_cmd, lnet_stats_output, lustre_metrics_output, net_show_output,
@@ -46,6 +47,8 @@ pub enum Error {
     TaskJoin(#[from] tokio::task::JoinError),
     #[error(transparent)]
     Utf8(#[from] std::str::Utf8Error),
+    #[error("{0}")]
+    Other(String),
 }
 
 impl IntoResponse for Error {

@@ -1408,6 +1408,7 @@ dependencies = [
  "criterion",
  "iai-callgrind",
  "insta",
+ "libc",
  "lustre_collector",
  "pretty_assertions",
  "prometheus-client",

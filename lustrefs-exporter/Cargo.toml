@@ -9,6 +9,7 @@ async-stream = "0.3.6"
 axum = { workspace = true, features = ["http2"] }
 bytes = "1"
 clap = { workspace = true, features = ["derive", "env", "wrap_help", "string"] }
+libc = "0.2"
 lustre_collector.path = "../lustre-collector"
 prometheus-client.workspace = true
 
@@ -18,6 +19,9 @@ tokio = { workspace = true, features = [
   "macros",
   "process",
   "rt-multi-thread",
+  "io-util",
+  "net",
+  "signal",
 ] }
 tower = { workspace = true, features = ["timeout", "load-shed", "limit"] }
 tower-http = { workspace = true, features = ["compression-full"] }
